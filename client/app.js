@@ -18,6 +18,13 @@ let filters = {
   page: 1,
 };
 
+// Monotonic id for the latest issued fetch. Every fetchBookings call
+// captures its own id at the top; responses that find their id no longer
+// equal to currentFetchId have been superseded and are dropped before
+// touching the DOM. This is what prevents the "filter reset" symptom:
+// without it, a slow poll response can overwrite a freshly-filtered list.
+let currentFetchId = 0;
+
 // ============================================
 // Initialization
 // ============================================
@@ -70,6 +77,8 @@ function initFilters() {
 // ============================================
 
 async function fetchBookings(currentFilters) {
+  const fetchId = ++currentFetchId;
+
   const loadingEl = document.getElementById('loading-indicator');
   const errorEl = document.getElementById('error-message');
   const listEl = document.getElementById('bookings-list');
@@ -89,6 +98,8 @@ async function fetchBookings(currentFilters) {
     });
     const result = await response.json();
 
+    if (fetchId !== currentFetchId) return;  // superseded by newer request
+
     loadingEl.style.display = 'none';
 
     if (result.error) {
@@ -100,6 +111,7 @@ async function fetchBookings(currentFilters) {
     renderBookings(result.data, listEl);
     renderPagination(result);
   } catch (err) {
+    if (fetchId !== currentFetchId) return;  // superseded by newer request
     loadingEl.style.display = 'none';
     errorEl.textContent = 'Failed to load bookings. Is the server running?';
     errorEl.style.display = 'block';

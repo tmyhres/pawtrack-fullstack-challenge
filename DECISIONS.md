@@ -78,7 +78,7 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 | F-06 | Double-booking race — overlap check has TOCTOU window | data-integrity | critical | both | ☑ |
 | F-07 | Pagination off-by-one (`offset = page * limit`) drops first page | data-integrity, ux | high | both | ☑ |
 | F-08 | No request body validation on `POST /api/bookings` or `PATCH …/status` | data-integrity, api-design | high | both | ☐ |
-| F-09 | Frontend fetch race: poll + filter change + refresh, last-response-wins | ux, data-integrity | high | static | ☐ |
+| F-09 | Frontend fetch race: poll + filter change + refresh, last-response-wins | ux, data-integrity | high | both | ☑ |
 | F-10 | Overlap check broken for bookings that cross midnight | data-integrity | high | both | ☐ |
 | F-11 | Date filter uses `startsWith` on ISO string — wrong across timezones | data-integrity, ux | high | both | ☐ |
 | F-12 | Wrong status codes — 404 returns 200, errors return 200 | api-design | medium | both | ☐ |
@@ -233,10 +233,18 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 - **File(s):** `client/app.js:33-36, 52-65, 100`
 - **Classification:** ux, data-integrity
 - **Severity:** high
-- **Verified:** static
+- **Verified:** both
 - **What:** `setInterval` polls every 15s while filter changes also fire `fetchBookings`. No request id, no cancellation. A slow poll response that resolves after a fast filter response will overwrite the filtered list — this maps directly to the "filters seem to reset randomly" complaint in the brief.
 - **Why it matters:** Most-recent intent must win; right now most-recent *response* wins. Combined with F-12/F-13, errors compound silently.
-- **Fix (Phase 2):** _pending_
+- **Fix (Phase 2):** Added a module-scope monotonic `currentFetchId`. Each `fetchBookings` call captures `++currentFetchId` at the top into a local `fetchId`. After the response (or error) arrives, the function checks `fetchId !== currentFetchId` — if a newer request has been issued in the meantime, the stale response is discarded before touching the DOM.
+
+  **Why a token, not `AbortController`:** AbortController would also stop the network transfer, which is strictly better when response bodies are large. Here responses are small JSON, the network cost is negligible, and the token is ~5 lines vs ~15 for full AbortController plumbing. If responses grow (e.g. a future export endpoint) switching to AbortController is a one-pass refactor — the pattern stays the same, only the cancel mechanism changes.
+
+  **Why not just skip the poll while a fetch is in flight:** that would still allow the user's *own* rapid actions (filter change → refresh → filter change again) to race against each other. The token approach handles every interleaving, including all-user-initiated ones.
+
+  **Verified at runtime:** Playwright test monkey-patches `window.fetch` so the first `/api/bookings` call gets an artificial 600ms delay, then fires two `fetchBookings` calls back-to-back — first with no filter, second with `status=confirmed`. With the fix: rendered list is exactly the 2 Portland confirmed bookings (#001 + #006), no stale "all bookings" overwrite. Without the fix this exact probe reproduced the "filter reset" bug.
+
+  **Suggested regression test (Phase 3 suite):** mock `fetch` to delay the first call, fire two `fetchBookings` calls with different filters, assert the rendered DOM matches the second filter's expected result set. ✅
 
 ### F-10 — Overlap check broken for bookings that cross midnight
 
