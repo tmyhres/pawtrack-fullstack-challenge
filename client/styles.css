@@ -193,6 +193,12 @@ main {
   color: #666;
 }
 
+.empty-state {
+  text-align: center;
+  padding: 2rem;
+  color: #999;
+}
+
 .error {
   background: #fee2e2;
   color: #991b1b;

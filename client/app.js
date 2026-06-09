@@ -18,6 +18,32 @@ let filters = {
   page: 1,
 };
 
+// Monotonic id for the latest issued fetch. Every fetchBookings call
+// captures its own id at the top; responses that find their id no longer
+// equal to currentFetchId have been superseded and are dropped before
+// touching the DOM. This is what prevents the "filter reset" symptom:
+// without it, a slow poll response can overwrite a freshly-filtered list.
+let currentFetchId = 0;
+
+// Extract the most useful error string from a JSON error response. Fastify
+// schema-validation errors put the detail in `message` (with a generic
+// `error: "Bad Request"`), while our handlers send `{ error }`. Prefer
+// `message`, then `error`, then a status-coded fallback.
+function errorText(result, response, fallback) {
+  return (result && (result.message || result.error)) || `${fallback} (${response.status})`;
+}
+
+// A <input type="date"> yields a bare "YYYY-MM-DD". `new Date(value)` parses
+// that as UTC midnight, which lands on the *previous* calendar day once the
+// server projects it into a behind-UTC tenant timezone (e.g. Portland) — the
+// booking would then file under the wrong day and dodge overlap checks.
+// Anchoring at noon UTC keeps the selected calendar date intact for every
+// real tenant timezone (UTC-12 .. UTC+11). The actual time-of-day is carried
+// separately by startTime/endTime.
+function scheduledDateFromInput(value) {
+  return new Date(`${value}T12:00:00.000Z`).toISOString();
+}
+
 // ============================================
 // Initialization
 // ============================================
@@ -70,6 +96,8 @@ function initFilters() {
 // ============================================
 
 async function fetchBookings(currentFilters) {
+  const fetchId = ++currentFetchId;
+
   const loadingEl = document.getElementById('loading-indicator');
   const errorEl = document.getElementById('error-message');
   const listEl = document.getElementById('bookings-list');
@@ -89,10 +117,12 @@ async function fetchBookings(currentFilters) {
     });
     const result = await response.json();
 
+    if (fetchId !== currentFetchId) return;  // superseded by newer request
+
     loadingEl.style.display = 'none';
 
-    if (result.error) {
-      errorEl.textContent = result.error;
+    if (!response.ok) {
+      errorEl.textContent = errorText(result, response, 'Request failed');
       errorEl.style.display = 'block';
       return;
     }
@@ -100,6 +130,7 @@ async function fetchBookings(currentFilters) {
     renderBookings(result.data, listEl);
     renderPagination(result);
   } catch (err) {
+    if (fetchId !== currentFetchId) return;  // superseded by newer request
     loadingEl.style.display = 'none';
     errorEl.textContent = 'Failed to load bookings. Is the server running?';
     errorEl.style.display = 'block';
@@ -107,62 +138,90 @@ async function fetchBookings(currentFilters) {
 }
 
 function renderBookings(bookings, container) {
+  container.replaceChildren();
+
   if (!bookings || bookings.length === 0) {
-    container.innerHTML = '<p style="text-align: center; color: #999; padding: 2rem;">No bookings found.</p>';
+    const empty = document.createElement('p');
+    empty.className = 'empty-state';
+    empty.textContent = 'No bookings found.';
+    container.appendChild(empty);
     return;
   }
 
-  container.innerHTML = bookings.map(booking => {
-    const date = new Date(booking.scheduledDate).toLocaleDateString();
-    const statusActions = getStatusActions(booking);
-
-    return `
-      <div class="booking-card">
-        <div class="booking-info">
-          <h3>Booking ${booking.id.replace('booking_', '#')}</h3>
-          <div class="booking-meta">
-            <span>Pet: ${booking.petId}</span>
-            <span>Sitter: ${booking.sitterId}</span>
-            <span>Date: ${date}</span>
-            <span>Time: ${booking.startTime} - ${booking.endTime}</span>
-          </div>
-          <div class="booking-notes">${booking.notes}</div>
-        </div>
-        <div class="booking-actions">
-          <span class="status-badge status-${booking.status}">
-            ${booking.status.replace('_', ' ')}
-          </span>
-          ${statusActions}
-        </div>
-      </div>
-    `;
-  }).join('');
-
-  // Attach status transition handlers
-  container.querySelectorAll('[data-action="transition"]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const bookingId = btn.dataset.bookingId;
-      const newStatus = btn.dataset.newStatus;
-      transitionStatus(bookingId, newStatus);
-    });
-  });
+  for (const booking of bookings) {
+    container.appendChild(buildBookingCard(booking));
+  }
 }
 
-function getStatusActions(booking) {
-  const transitions = {
-    requested: ['confirmed', 'cancelled'],
-    confirmed: ['in_progress', 'cancelled'],
-    in_progress: ['completed'],
-    completed: [],
-    cancelled: [],
-  };
+// Build each card with explicit DOM nodes — never innerHTML on values from
+// the server. notes / IDs / status / time strings all go through textContent,
+// so an `<img onerror=...>` in a booking note renders as literal text.
+function buildBookingCard(booking) {
+  const card = document.createElement('div');
+  card.className = 'booking-card';
 
-  const actions = transitions[booking.status] || [];
-  return actions.map(status => {
-    const label = status.replace('_', ' ');
-    const btnClass = status === 'cancelled' ? 'btn-secondary' : 'btn-primary';
-    return `<button class="btn btn-sm ${btnClass}" data-action="transition" data-booking-id="${booking.id}" data-new-status="${status}">${label}</button>`;
-  }).join('');
+  const info = document.createElement('div');
+  info.className = 'booking-info';
+
+  const h3 = document.createElement('h3');
+  h3.textContent = `Booking ${booking.id.replace('booking_', '#')}`;
+  info.appendChild(h3);
+
+  const meta = document.createElement('div');
+  meta.className = 'booking-meta';
+  const date = new Date(booking.scheduledDate).toLocaleDateString();
+  for (const label of [
+    `Pet: ${booking.petId}`,
+    `Sitter: ${booking.sitterId}`,
+    `Date: ${date}`,
+    `Time: ${booking.startTime} - ${booking.endTime}`,
+  ]) {
+    const span = document.createElement('span');
+    span.textContent = label;
+    meta.appendChild(span);
+  }
+  info.appendChild(meta);
+
+  const notes = document.createElement('div');
+  notes.className = 'booking-notes';
+  notes.textContent = booking.notes;
+  info.appendChild(notes);
+
+  card.appendChild(info);
+
+  const actions = document.createElement('div');
+  actions.className = 'booking-actions';
+
+  const badge = document.createElement('span');
+  badge.className = `status-badge status-${booking.status}`;
+  badge.textContent = booking.status.replace('_', ' ');
+  actions.appendChild(badge);
+
+  for (const btn of buildStatusActionButtons(booking)) {
+    actions.appendChild(btn);
+  }
+
+  card.appendChild(actions);
+  return card;
+}
+
+const NEXT_STATUSES = {
+  requested: ['confirmed', 'cancelled'],
+  confirmed: ['in_progress', 'cancelled'],
+  in_progress: ['completed'],
+  completed: [],
+  cancelled: [],
+};
+
+function buildStatusActionButtons(booking) {
+  const next = NEXT_STATUSES[booking.status] || [];
+  return next.map(status => {
+    const btn = document.createElement('button');
+    btn.className = `btn btn-sm ${status === 'cancelled' ? 'btn-secondary' : 'btn-primary'}`;
+    btn.textContent = status.replace('_', ' ');
+    btn.addEventListener('click', () => transitionStatus(booking.id, status));
+    return btn;
+  });
 }
 
 async function transitionStatus(bookingId, newStatus) {
@@ -174,11 +233,11 @@ async function transitionStatus(bookingId, newStatus) {
     });
     const result = await response.json();
 
-    if (result.success) {
+    if (response.ok) {
       showToast(`Booking updated to ${newStatus.replace('_', ' ')}`, 'success');
       fetchBookings(filters);
     } else {
-      showToast(result.error || 'Failed to update status', 'error');
+      showToast(errorText(result, response, 'Failed to update status'), 'error');
     }
   } catch (err) {
     showToast('Network error. Please try again.', 'error');
@@ -283,7 +342,7 @@ async function createBooking() {
   const body = {
     petId: document.getElementById('pet-select').value,
     sitterId: document.getElementById('sitter-select').value,
-    scheduledDate: new Date(document.getElementById('booking-date').value).toISOString(),
+    scheduledDate: scheduledDateFromInput(document.getElementById('booking-date').value),
     startTime: document.getElementById('start-time').value,
     endTime: document.getElementById('end-time').value,
     notes: document.getElementById('booking-notes').value,
@@ -297,13 +356,13 @@ async function createBooking() {
     });
     const result = await response.json();
 
-    if (result.success) {
+    if (response.ok) {
       showToast('Booking created!', 'success');
       modal.style.display = 'none';
       form.reset();
       fetchBookings(filters);
     } else {
-      showToast(result.error || 'Failed to create booking', 'error');
+      showToast(errorText(result, response, 'Failed to create booking'), 'error');
     }
   } catch (err) {
     showToast('Network error. Please try again.', 'error');
