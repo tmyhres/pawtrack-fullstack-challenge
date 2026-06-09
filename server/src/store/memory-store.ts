@@ -63,6 +63,36 @@ class MemoryStore {
     return booking;
   }
 
+  /**
+   * Atomic check-and-insert: reject if any non-cancelled booking for the same
+   * sitter overlaps the candidate's time window, otherwise persist the booking.
+   *
+   * Must remain synchronous end-to-end — the absence of an `await` between the
+   * overlap scan and the `set` is the entire reason a second concurrent caller
+   * cannot interleave a duplicate insert. Do not introduce one.
+   */
+  public tryCreateBookingForSitter(
+    booking: Booking,
+  ): { created: Booking } | { conflict: { existingBookingId: string } } {
+    const [candidateDate] = booking.scheduledDate.split('T');
+    const candidateStart = new Date(`${candidateDate}T${booking.startTime}`);
+    const candidateEnd = new Date(`${candidateDate}T${booking.endTime}`);
+
+    for (const existing of this.bookings.values()) {
+      if (existing.sitterId !== booking.sitterId) continue;
+      if (existing.status === 'cancelled') continue;
+      const [existingDate] = existing.scheduledDate.split('T');
+      const existingStart = new Date(`${existingDate}T${existing.startTime}`);
+      const existingEnd = new Date(`${existingDate}T${existing.endTime}`);
+      if (candidateStart < existingEnd && candidateEnd > existingStart) {
+        return { conflict: { existingBookingId: existing.id } };
+      }
+    }
+
+    this.bookings.set(booking.id, { ...booking });
+    return { created: booking };
+  }
+
   public updateBooking(booking: Booking): Booking {
     this.bookings.set(booking.id, { ...booking });
     return booking;

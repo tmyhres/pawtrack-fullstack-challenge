@@ -63,32 +63,12 @@ export class BookingService {
   }
 
   /**
-   * Create a new booking.
-   * Checks for overlapping bookings with the same sitter.
+   * Create a new booking. Overlap detection and persistence are delegated to
+   * `store.tryCreateBookingForSitter`, which performs both in a single
+   * synchronous call frame — concurrent callers cannot interleave duplicates.
    */
-  public async createBooking(params: CreateBookingParams): Promise<Booking> {
+  public createBooking(params: CreateBookingParams): Booking {
     const { tenantId, petId, sitterId, scheduledDate, startTime, endTime, notes, createdBy } = params;
-
-    // Check for overlapping bookings with the same sitter
-    const existingBookings = store.getAllBookings().filter(
-      b => b.sitterId === sitterId && b.status !== 'cancelled',
-    );
-
-    const hasOverlap = existingBookings.some(b => {
-      const existingStart = new Date(`${b.scheduledDate.split('T')[0]}T${b.startTime}`);
-      const existingEnd = new Date(`${b.scheduledDate.split('T')[0]}T${b.endTime}`);
-      const newStart = new Date(`${scheduledDate.split('T')[0]}T${startTime}`);
-      const newEnd = new Date(`${scheduledDate.split('T')[0]}T${endTime}`);
-
-      return newStart < existingEnd && newEnd > existingStart;
-    });
-
-    if (hasOverlap) {
-      throw new Error('Sitter has an overlapping booking for this time slot');
-    }
-
-    // Simulate async operation (like a database write)
-    await new Promise(resolve => setTimeout(resolve, 10));
 
     const now = new Date().toISOString();
     const booking: Booking = {
@@ -107,16 +87,19 @@ export class BookingService {
       statusChangedBy: createdBy,
     };
 
-    store.createBooking(booking);
+    const result = store.tryCreateBookingForSitter(booking);
+    if ('conflict' in result) {
+      throw new Error('Sitter has an overlapping booking for this time slot');
+    }
 
     eventBus.emit('booking.created', {
-      bookingId: booking.id,
-      tenantId: booking.tenantId,
-      petId: booking.petId,
-      sitterId: booking.sitterId,
+      bookingId: result.created.id,
+      tenantId: result.created.tenantId,
+      petId: result.created.petId,
+      sitterId: result.created.sitterId,
     });
 
-    return booking;
+    return result.created;
   }
 
   /**

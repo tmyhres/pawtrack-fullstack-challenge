@@ -75,7 +75,7 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 | F-03 | `PATCH /api/bookings/:id/status` performs no tenant check | tenancy, data-integrity | critical | both | ☑ |
 | F-04 | `POST /api/bookings` does not verify pet/sitter belong to caller's tenant | tenancy, data-integrity | critical | both | ☐ |
 | F-05 | XSS via `innerHTML` interpolation of booking & pet fields | security | critical | both | ☐ |
-| F-06 | Double-booking race — overlap check has TOCTOU window | data-integrity | critical | both | ☐ |
+| F-06 | Double-booking race — overlap check has TOCTOU window | data-integrity | critical | both | ☑ |
 | F-07 | Pagination off-by-one (`offset = page * limit`) drops first page | data-integrity, ux | high | both | ☐ |
 | F-08 | No request body validation on `POST /api/bookings` or `PATCH …/status` | data-integrity, api-design | high | both | ☐ |
 | F-09 | Frontend fetch race: poll + filter change + refresh, last-response-wins | ux, data-integrity | high | static | ☐ |
@@ -93,6 +93,7 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 | F-21 | No request logging enrichment with tenant/user/correlation id | observability | low | static | ☐ |
 | F-22 | Three known CVEs in pinned deps (fastify, fast-uri, uuid); `npm audit` reports fixes available | security | medium | static | ☑ |
 | F-23 | Bad input (F-08) crashes list endpoint with HTTP 500 when `date` filter applied | data-integrity, availability | high | runtime | ☐ |
+| F-24 | No idempotency on `POST /api/bookings` — client retry / double-click creates duplicate bookings | data-integrity, api-design | medium | static | deferred (Phase 3 proposal) |
 
 <!-- Per-finding blocks below this line -->
 
@@ -148,13 +149,35 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 
 ### F-06 — Double-booking race — overlap check has TOCTOU window
 
-- **File(s):** `server/src/services/booking-service.ts:73-110`
+- **File(s):** `server/src/services/booking-service.ts:73-110`, `server/src/store/memory-store.ts`
 - **Classification:** data-integrity
 - **Severity:** critical
-- **Verified:** static
+- **Verified:** both — Phase 1b proof was 5 concurrent POSTs → 5 duplicate bookings
 - **What:** Check-then-write: `existingBookings.some(...)` → `await new Promise(setTimeout(10))` → `store.createBooking(...)`. Two concurrent POSTs both pass the overlap check before either inserts, and both succeed.
 - **Why it matters:** This is the "two sitters were assigned to the same pet at the same time" incident from the brief. The deliberate `setTimeout(10)` makes the window trivially exploitable in test.
-- **Fix (Phase 2):** _pending_
+- **Fix (Phase 2):** Moved the atomicity contract from the service into the store. Added `MemoryStore.tryCreateBookingForSitter(booking)`, which iterates existing bookings synchronously and either persists the candidate or returns `{ conflict: { existingBookingId } }`. `BookingService.createBooking` is no longer `async` and no longer contains the artificial `await setTimeout(10)` — it just calls the store helper.
+
+  **Why structure it this way:** the minimum fix would have been to delete the `await setTimeout(10)`. That fixes the bug *today* but the moment someone later refactors `createBooking` to do a legitimate `await` (e.g. when swapping the in-memory store for a real DB), the TOCTOU window comes back silently. Pushing atomicity into the store expresses the invariant ("no two non-cancelled bookings overlap for the same sitter") at the layer that owns the data, with an inline comment in the store method warning against introducing `await` in the critical section. Future refactors of the service can't break this layer.
+
+  **What this is not:** the helper guarantees *atomicity for a single Node process and an in-memory store*. The moment we move to a real relational DB the right primitive changes — Postgres `EXCLUDE` constraint with a `tstzrange`, or a serializable transaction wrapping a `SELECT FOR UPDATE` on a `sitter_schedule` row. Noted as future work in proposals.
+
+  **Verified:** the same 5-concurrent-POSTs probe that produced 5 duplicates in Phase 1b now produces **1 success + 4 conflict rejections**, exactly one booking persisted. Typecheck clean. ✅
+
+  **Related deferred concern (F-24):** F-06 fixes server-side concurrency only. A client that retries (network blip, double-click) can still create a duplicate booking by re-sending the same POST. See F-24 and the Phase 3 idempotency proposal.
+
+### F-24 — No idempotency on `POST /api/bookings`
+
+- **File(s):** `server/src/routes/bookings.ts`, `server/src/services/booking-service.ts`
+- **Classification:** data-integrity, api-design
+- **Severity:** medium
+- **Verified:** static (logically follows from F-06's fix — same client behavior, different mechanism)
+- **What:** With F-06 fixed, server-side concurrency can't duplicate a booking. But if the client *re-sends* a POST that already succeeded (network blip swallowed the response, user double-clicked the "Create Booking" button, mobile app replays a queued request after reconnect), the server has no way to recognise the second request as a replay of the first — it just creates another booking.
+- **Why it matters:** This is the next double-booking incident waiting to happen, and unlike F-06 it doesn't require concurrency — single-threaded clients hit it routinely. It's not in the README's incident list, but it's table stakes for a real booking API.
+- **Fix:** **Not** fixed in Phase 2 — documented here so it's visible, then designed in full in the Phase 3 "Improvements Proposed" section. Brief sketch:
+  - Client sends `Idempotency-Key: <uuid>` header on `POST /api/bookings`.
+  - Server keeps `(tenantId, idempotencyKey) → bookingId` with a TTL (24h).
+  - Replay with same key → return the original booking (200), not a new row.
+  - Same key + different payload → 409 Conflict (catches "I retried but tweaked the body").
 
 ### F-07 — Pagination off-by-one (`offset = page * limit`)
 
