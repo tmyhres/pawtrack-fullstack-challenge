@@ -10,21 +10,17 @@ export function bookingRoutes(app: FastifyInstance): void {
   app.get('/api/bookings', async (request: FastifyRequest, reply: FastifyReply) => {
     const auth = (request as any).auth as AuthContext;
     const query = request.query as {
-      tenantId?: string;
       page?: string;
       limit?: string;
       date?: string;
       status?: string;
     };
 
-    // Support tenant override for admin views
-    const tenantId = query.tenantId || auth.tenantId;
-
     const page = parseInt(query.page || '1', 10);
     const limit = parseInt(query.limit || '10', 10);
 
     const result = bookingService.listBookings({
-      tenantId,
+      tenantId: auth.tenantId,
       page,
       limit,
       date: query.date,

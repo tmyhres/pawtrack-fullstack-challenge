@@ -70,7 +70,7 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 
 | ID | Title | Classification | Severity | Verified | Fixed |
 |---|---|---|---|---|---|
-| F-01 | Tenant override via `?tenantId=` query param | tenancy, security | critical | both | ☐ |
+| F-01 | Tenant override via `?tenantId=` query param | tenancy, security | critical | both | ☑ |
 | F-02 | `GET /api/bookings/:id` performs no tenant check | tenancy | critical | both | ☐ |
 | F-03 | `PATCH /api/bookings/:id/status` performs no tenant check | tenancy, data-integrity | critical | both | ☐ |
 | F-04 | `POST /api/bookings` does not verify pet/sitter belong to caller's tenant | tenancy, data-integrity | critical | both | ☐ |
@@ -104,7 +104,7 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 - **Verified:** both
 - **What:** `const tenantId = query.tenantId || auth.tenantId;` allows any authenticated caller to read another tenant's bookings just by appending `?tenantId=tenant_seattle`.
 - **Why it matters:** This is exactly the "customer saw another customer's bookings" incident in the brief. There is no role gate, so a staff (or sitter) account from one tenant can read the entire booking list of another.
-- **Fix (Phase 2):** _pending_
+- **Fix (Phase 2):** Removed the query-param override outright. `GET /api/bookings` now sources `tenantId` from `auth.tenantId` only. The legitimate "admin cross-tenant view" use case is deferred to Phase 3 proposals — it needs a verified `role=admin` claim before the override can be safely reintroduced (see F-14). Verified: `GET /api/bookings?tenantId=tenant_seattle` from a Portland session returns only `tenant_portland` rows (10 total) instead of leaking Seattle data. ✅
 
 ### F-02 — `GET /api/bookings/:id` performs no tenant check
 
