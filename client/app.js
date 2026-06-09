@@ -102,8 +102,8 @@ async function fetchBookings(currentFilters) {
 
     loadingEl.style.display = 'none';
 
-    if (result.error) {
-      errorEl.textContent = result.error;
+    if (!response.ok) {
+      errorEl.textContent = result.error || `Request failed (${response.status})`;
       errorEl.style.display = 'block';
       return;
     }
@@ -214,11 +214,11 @@ async function transitionStatus(bookingId, newStatus) {
     });
     const result = await response.json();
 
-    if (result.success) {
+    if (response.ok) {
       showToast(`Booking updated to ${newStatus.replace('_', ' ')}`, 'success');
       fetchBookings(filters);
     } else {
-      showToast(result.error || 'Failed to update status', 'error');
+      showToast(result.error || `Failed to update status (${response.status})`, 'error');
     }
   } catch (err) {
     showToast('Network error. Please try again.', 'error');
@@ -337,13 +337,13 @@ async function createBooking() {
     });
     const result = await response.json();
 
-    if (result.success) {
+    if (response.ok) {
       showToast('Booking created!', 'success');
       modal.style.display = 'none';
       form.reset();
       fetchBookings(filters);
     } else {
-      showToast(result.error || 'Failed to create booking', 'error');
+      showToast(result.error || result.message || `Failed to create booking (${response.status})`, 'error');
     }
   } catch (err) {
     showToast('Network error. Please try again.', 'error');

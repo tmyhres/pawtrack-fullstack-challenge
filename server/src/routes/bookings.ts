@@ -105,7 +105,7 @@ export function bookingRoutes(app: FastifyInstance): void {
     }
 
     try {
-      const booking = await bookingService.createBooking({
+      const booking = bookingService.createBooking({
         tenantId: auth.tenantId,
         petId: body.petId,
         sitterId: body.sitterId,
@@ -116,9 +116,16 @@ export function bookingRoutes(app: FastifyInstance): void {
         createdBy: auth.userId,
       });
 
-      return reply.code(200).send({ success: true, data: booking });
+      return reply.code(201).send({ data: booking });
     } catch (error: any) {
-      return reply.code(200).send({ success: false, error: error.message });
+      // The only thrown error from createBooking today is the overlap conflict.
+      // Map it to 409. Anything truly unexpected re-throws to the Fastify
+      // default error handler (500). A future refactor of createBooking to a
+      // result type would let us drop the string match.
+      if (typeof error?.message === 'string' && error.message.includes('overlapping')) {
+        return reply.code(409).send({ error: error.message });
+      }
+      throw error;
     }
   });
 
@@ -148,7 +155,12 @@ export function bookingRoutes(app: FastifyInstance): void {
     }
 
     const result = bookingService.updateStatus(id, status, auth.userId);
+    if (!result.success) {
+      // Invalid status transition (e.g. requested -> completed). Existence has
+      // already been checked above, so 409 is the right code here.
+      return reply.code(409).send({ error: result.error });
+    }
 
-    return reply.code(200).send(result);
+    return reply.code(200).send({ data: result.booking });
   });
 }

@@ -13,7 +13,7 @@
 | Phase 1a (static audit) | ~10 min | ~10–12 min | 22 findings catalogued from cold-read of all server + client files. |
 | Phase 1b (runtime verification) | ~10–15 min | ~5 min | 12 findings escalated to `Verified: both`; F-23 newly discovered at runtime (input-gap → 500). |
 | **Pre-Phase 2: dep upgrade** | ~10 min | ~5 min | Pinned fastify@5.8.5, uuid@11.1.1, fast-uri@3.1.2 (via `overrides`). `npm audit` now reports 0 vulnerabilities. Typecheck + smoke tests all green. F-22 closed. |
-| Phase 2 (fixes) | ~40 min | pending | 13 steps, brief-incident-first order. |
+| Phase 2 (fixes) | ~40 min | ~30 min spent, in progress | All criticals + all highs landed (11 commits, F-22, F-01..F-07, F-08+F-23, F-09, F-10, F-11). Mediums next: F-12+F-13 (HTTP status discipline + status-aware fetch), F-15 (CORS). All three brief incidents closed. |
 | Phase 3 (improve + propose) | ~25 min | pending | One implemented improvement + two written proposals. |
 
 ## Conventions
@@ -81,8 +81,8 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 | F-09 | Frontend fetch race: poll + filter change + refresh, last-response-wins | ux, data-integrity | high | both | ☑ |
 | F-10 | Overlap check broken for bookings that cross midnight | data-integrity | high | both | ☑ |
 | F-11 | Date filter uses `startsWith` on ISO string — wrong across timezones | data-integrity, ux | high | both | ☑ |
-| F-12 | Wrong status codes — 404 returns 200, errors return 200 | api-design | medium | both | ☐ |
-| F-13 | Frontend branches on `result.error`, ignores HTTP status entirely | api-design, ux | medium | static | ☐ |
+| F-12 | Wrong status codes — 404 returns 200, errors return 200 | api-design | medium | both | ☑ |
+| F-13 | Frontend branches on `result.error`, ignores HTTP status entirely | api-design, ux | medium | static | ☑ |
 | F-14 | `X-User-Role` is trusted unvalidated; no role enforcement anywhere | security, architecture | medium | static | ☐ |
 | F-15 | CORS `origin: true` allows any origin | security | medium | static | ☐ |
 | F-16 | `scheduledDate` timezone-inconsistent (seed mixes UTC + offset; client uses local→UTC) | data-integrity, architecture | medium | static | ☐ |
@@ -321,20 +321,41 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 - **File(s):** `server/src/routes/bookings.ts:46, 79-82, 96`
 - **Classification:** api-design
 - **Severity:** medium
-- **Verified:** static
+- **Verified:** both
 - **What:** Not-found returns `code(200).send({ error: 'Booking not found' })`. Create-conflict returns `code(200).send({ success: false, error })`. Status update returns `code(200)` regardless of outcome.
 - **Why it matters:** Breaks HTTP semantics — caches, monitoring, fetch error branches, and retry middleware all key off status codes. Couples API consumers to a custom envelope.
-- **Fix (Phase 2):** _pending_
+- **Fix (Phase 2):** Aligned all booking endpoints to HTTP-status-driven contracts. The `success` envelope is gone. Status codes now express outcome; bodies are `{ data: … }` on success and `{ error: string }` on failure.
+
+  - `POST /api/bookings`: **201** + `{ data: booking }` on success; **400** from F-08 schema; **404** + `{ error: "Pet not found" | "Sitter not found" }` (F-04); **409** + `{ error }` on overlap.
+  - `PATCH /api/bookings/:id/status`: **200** + `{ data: booking }` on success; **404** for missing/foreign-tenant (F-03); **409** + `{ error }` for invalid status transitions.
+  - `GET /api/bookings/:id` was already aligned (F-02).
+  - `GET /api/bookings` returns the paginated result directly (unchanged).
+
+  **Overlap detection is still string-matched** (`error.message.includes('overlapping')`) for the 409 branch. The cleaner pattern is to refactor `BookingService.createBooking` to return a discriminated union (`{ ok: true, booking } | { ok: false, reason: 'overlap', existingBookingId }`), which would also let the API surface the existing booking id in the 409 response — useful for F-24 (idempotency). Captured as future work.
+
+  **Verified:**
+  - POST valid → **201** `{ data }` (was 200 `{ success: true, data }`)
+  - POST overlap → **409** `{ error }` (was 200 `{ success: false, error }`)
+  - PATCH valid → **200** `{ data }` (was 200 `{ success: true, booking }`)
+  - PATCH invalid transition → **409** `{ error }`
+  - GET unknown id → **404** (unchanged from F-02) ✅
 
 ### F-13 — Frontend branches on `result.error`, ignores HTTP status entirely
 
 - **File(s):** `client/app.js:87-106, 168-186, 292-310`
 - **Classification:** api-design, ux
 - **Severity:** medium
-- **Verified:** static
+- **Verified:** both
 - **What:** `const result = await response.json()` regardless of `response.ok`. 401/500/aborted responses with non-JSON bodies will throw silently or render misleading errors.
 - **Why it matters:** Auth errors look like "no bookings"; server crashes look like a transient blip. Must align with the F-12 fix.
-- **Fix (Phase 2):** _pending_
+- **Fix (Phase 2):** All three client fetch paths now branch on `response.ok` first:
+  - `fetchBookings`: on `!response.ok`, populate the error banner with `result.error || \`Request failed (${response.status})\``.
+  - `transitionStatus`: on `!response.ok`, toast `result.error || \`Failed to update status (${response.status})\``.
+  - `createBooking`: on `!response.ok`, toast `result.error || result.message || \`Failed to create booking (${response.status})\``. The `result.message` fallback catches Fastify's schema-validation error body which uses `message` rather than `error` for the human-readable text.
+
+  **What this is *not*:** RFC 7807 problem-details. The current `{ error: string }` shape is fine for an admin dashboard with a single consumer; full problem-details would be the right move once the API has third-party consumers. Captured as future work.
+
+  **Verified at runtime:** Playwright probe creates a booking via the new 201 + `{ data }` contract and confirms (a) `validRes.status === 201`, (b) the new booking renders in the dashboard after a `fetchBookings`, (c) error banner stays hidden. The F-09 race-test fix still passes because the `response.ok` check runs *after* the fetchId guard. ✅
 
 ### F-14 — `X-User-Role` is trusted unvalidated; no role enforcement anywhere
 
