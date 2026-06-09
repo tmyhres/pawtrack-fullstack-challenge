@@ -80,7 +80,7 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 | F-08 | No request body validation on `POST /api/bookings` or `PATCH …/status` | data-integrity, api-design | high | both | ☑ |
 | F-09 | Frontend fetch race: poll + filter change + refresh, last-response-wins | ux, data-integrity | high | both | ☑ |
 | F-10 | Overlap check broken for bookings that cross midnight | data-integrity | high | both | ☑ |
-| F-11 | Date filter uses `startsWith` on ISO string — wrong across timezones | data-integrity, ux | high | both | ☐ |
+| F-11 | Date filter uses `startsWith` on ISO string — wrong across timezones | data-integrity, ux | high | both | ☑ |
 | F-12 | Wrong status codes — 404 returns 200, errors return 200 | api-design | medium | both | ☐ |
 | F-13 | Frontend branches on `result.error`, ignores HTTP status entirely | api-design, ux | medium | static | ☐ |
 | F-14 | `X-User-Role` is trusted unvalidated; no role enforcement anywhere | security, architecture | medium | static | ☐ |
@@ -294,10 +294,27 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 - **File(s):** `server/src/services/booking-service.ts:39`
 - **Classification:** data-integrity, ux
 - **Severity:** high
-- **Verified:** static (`booking_006` stored as `'2026-04-09T06:30:00Z'` but is 23:30 Pacific on 4/8)
+- **Verified:** both
 - **What:** `b.scheduledDate.startsWith(date)` only matches the literal UTC date prefix. A booking written in UTC for "April 8 evening Pacific" appears under April 9 in the filter.
 - **Why it matters:** Day-view of the dashboard mis-buckets evening bookings — the very ones a sitter most needs to see before their shift.
-- **Fix (Phase 2):** _pending_
+- **Fix (Phase 2):** `listBookings` now reads the tenant's IANA timezone (already in the seed: `America/Los_Angeles` for Portland/Seattle, `America/Chicago` for Austin), parses each booking's `scheduledDate` to an absolute instant, and uses `Intl.DateTimeFormat` with that timezone to extract the local YYYY-MM-DD. The filter compares that string to the validated `date` query param.
+
+  **`formatToParts` not `format()`:** the helper uses `Intl.DateTimeFormat('en-US', { timeZone, year, month, day }).formatToParts(instant)` and assembles `${year}-${month}-${day}` explicitly. This avoids depending on a locale's default date layout (`en-US` would otherwise format MM/DD/YYYY) and is robust across ICU versions.
+
+  **Fallback to UTC:** if a tenant somehow has no `timezone` field, the filter falls back to `'UTC'` rather than throwing. Better to bucket-by-UTC than crash a list endpoint that serves other tenants in the same process.
+
+  **Belt-and-braces:** the `typeof` and `Number.isNaN(instant.getTime())` checks protect against malformed `scheduledDate` rows arriving via a future ingestion path (same defensive posture as F-23).
+
+  **Acknowledged remaining limitation (F-16):** the seed itself stores `scheduledDate` in two different conventions — `…-07:00` offset for most rows and `Z` UTC for the late-night ones. The fix produces correct local dates regardless, but the underlying data model (a single instant plus a separate wall-clock `startTime/endTime`) is still inconsistent and will be the subject of F-16 if/when we touch the schema.
+
+  **Verified:**
+  - Portland `date=2026-04-08` → now includes `booking_006` (a 23:30 PT booking previously misfiled under 4/9) plus `booking_003`
+  - Portland `date=2026-04-09` → no longer includes `booking_006`
+  - Portland `date=2026-04-10` → still includes `booking_001` (offset-stored, no change)
+  - Seattle `date=2026-04-10` → now includes `booking_011` (the late-night overnight booking, previously misfiled under 4/11)
+  - Austin `date=2026-04-10` → returns `booking_012` (Chicago TZ, sanity) ✅
+
+  **Suggested regression test (Phase 3 suite):** for each tenant timezone in the seed, assert that a UTC-stored late-evening booking buckets under the local date and not the UTC date. This is the test that would have caught the original bug.
 
 ### F-12 — Wrong status codes — 404 returns 200, errors return 200
 

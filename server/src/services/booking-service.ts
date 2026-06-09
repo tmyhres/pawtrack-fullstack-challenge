@@ -4,6 +4,21 @@ import { VALID_TRANSITIONS } from '../types/index.js';
 import { store } from '../store/memory-store.js';
 import { eventBus } from './event-emitter.js';
 
+// Return YYYY-MM-DD for `instant` as observed in IANA timezone `tz`.
+// Uses formatToParts rather than .format() so we don't depend on a locale's
+// default date layout — explicit assembly is robust across ICU versions.
+function formatLocalDate(instant: Date, tz: string): string {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(instant);
+  const get = (type: 'year' | 'month' | 'day') =>
+    parts.find(p => p.type === type)?.value ?? '';
+  return `${get('year')}-${get('month')}-${get('day')}`;
+}
+
 interface ListBookingsParams {
   tenantId: string;
   page: number;
@@ -33,12 +48,22 @@ export class BookingService {
 
     let bookings = store.getBookingsByTenant(tenantId);
 
-    // Filter by date if provided. The `typeof` guard is belt-and-braces: the
-    // POST schema (F-08) now rejects rows without a scheduledDate at the
-    // boundary, but if a malformed row ever sneaks in via a future ingestion
-    // path the filter should still return [], not crash with a 500 (F-23).
+    // Filter by date in the *tenant's* timezone, not by UTC string prefix.
+    // The schema (F-08) validates `date` as YYYY-MM-DD. We project each
+    // booking's instant into the tenant's IANA timezone and compare the
+    // resulting local YYYY-MM-DD. Fallback to UTC if a tenant is missing a
+    // timezone — better to bucket by UTC than 500 on the request.
+    // The `typeof` guard is belt-and-braces against malformed scheduledDate
+    // rows arriving via a future ingestion path (F-23).
     if (date) {
-      bookings = bookings.filter(b => typeof b.scheduledDate === 'string' && b.scheduledDate.startsWith(date));
+      const tenant = store.getTenant(tenantId);
+      const tz = tenant?.timezone ?? 'UTC';
+      bookings = bookings.filter(b => {
+        if (typeof b.scheduledDate !== 'string') return false;
+        const instant = new Date(b.scheduledDate);
+        if (Number.isNaN(instant.getTime())) return false;
+        return formatLocalDate(instant, tz) === date;
+      });
     }
 
     // Filter by status if provided
