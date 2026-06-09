@@ -35,11 +35,13 @@ export function bookingRoutes(app: FastifyInstance): void {
    * Get a single booking by ID.
    */
   app.get('/api/bookings/:id', async (request: FastifyRequest, reply: FastifyReply) => {
+    const auth = (request as any).auth as AuthContext;
     const { id } = request.params as { id: string };
     const booking = bookingService.getBooking(id);
 
-    if (!booking) {
-      return reply.code(200).send({ error: 'Booking not found' });
+    // 404 (not 403) on tenant mismatch to avoid leaking existence
+    if (!booking || booking.tenantId !== auth.tenantId) {
+      return reply.code(404).send({ error: 'Booking not found' });
     }
 
     return reply.code(200).send({ data: booking });
@@ -86,6 +88,11 @@ export function bookingRoutes(app: FastifyInstance): void {
     const auth = (request as any).auth as AuthContext;
     const { id } = request.params as { id: string };
     const { status } = request.body as { status: BookingStatus };
+
+    const existing = bookingService.getBooking(id);
+    if (!existing || existing.tenantId !== auth.tenantId) {
+      return reply.code(404).send({ error: 'Booking not found' });
+    }
 
     const result = bookingService.updateStatus(id, status, auth.userId);
 

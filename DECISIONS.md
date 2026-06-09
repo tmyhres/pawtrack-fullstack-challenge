@@ -71,8 +71,8 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 | ID | Title | Classification | Severity | Verified | Fixed |
 |---|---|---|---|---|---|
 | F-01 | Tenant override via `?tenantId=` query param | tenancy, security | critical | both | ☑ |
-| F-02 | `GET /api/bookings/:id` performs no tenant check | tenancy | critical | both | ☐ |
-| F-03 | `PATCH /api/bookings/:id/status` performs no tenant check | tenancy, data-integrity | critical | both | ☐ |
+| F-02 | `GET /api/bookings/:id` performs no tenant check | tenancy | critical | both | ☑ |
+| F-03 | `PATCH /api/bookings/:id/status` performs no tenant check | tenancy, data-integrity | critical | both | ☑ |
 | F-04 | `POST /api/bookings` does not verify pet/sitter belong to caller's tenant | tenancy, data-integrity | critical | both | ☐ |
 | F-05 | XSS via `innerHTML` interpolation of booking & pet fields | security | critical | both | ☐ |
 | F-06 | Double-booking race — overlap check has TOCTOU window | data-integrity | critical | both | ☐ |
@@ -114,7 +114,7 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 - **Verified:** both
 - **What:** Handler calls `bookingService.getBooking(id)` and returns the booking irrespective of `auth.tenantId`.
 - **Why it matters:** Direct enumeration of `booking_001`…`booking_020` across tenants. Pet IDs and notes leak. Compare with `routes/pets.ts:30` which *does* check tenant — the pattern was understood, just not applied here.
-- **Fix (Phase 2):** _pending_
+- **Fix (Phase 2):** Handler now reads `auth.tenantId` and returns **404 (not 403)** when the booking either doesn't exist *or* belongs to another tenant. Returning 404 in both cases avoids leaking existence — an attacker can't distinguish "this ID doesn't exist" from "this ID exists but isn't mine," which would otherwise let them enumerate cross-tenant IDs by status code alone. Also fixes the F-12 side issue for this endpoint (previously returned 200 + `{error: …}` on not-found). Verified: Portland → Seattle booking returns `404`, Seattle → Seattle booking returns `200`. ✅
 
 ### F-03 — `PATCH /api/bookings/:id/status` performs no tenant check
 
@@ -124,7 +124,7 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 - **Verified:** both
 - **What:** Status transitions on any booking by ID, regardless of caller's tenant. The audit fields (`statusChangedBy`) are set from caller's user id even though they belong to a different tenant.
 - **Why it matters:** Lets one tenant cancel or progress another tenant's bookings. Corrupts the audit trail across tenants.
-- **Fix (Phase 2):** _pending_
+- **Fix (Phase 2):** Same pattern as F-02: handler resolves the booking, returns 404 if it doesn't exist OR doesn't match `auth.tenantId`, only then proceeds to the service's status transition. Kept the existence check at the route layer rather than pushing into the service so the tenancy contract stays visible at the API boundary. The service-level "audit forging" issue (`statusChangedBy` from header) is **not** addressed here — that's F-17, deferred. Verified: Portland → Seattle cancel returns 404; Seattle → Seattle transition still works. ✅
 
 ### F-04 — `POST /api/bookings` does not verify pet/sitter belong to caller's tenant
 
