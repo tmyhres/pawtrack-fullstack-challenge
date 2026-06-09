@@ -6,9 +6,19 @@ import { petRoutes } from './routes/pets.js';
 
 const app = Fastify({ logger: true });
 
-// Register CORS for frontend
+// CORS: allowed origins are a comma-separated env var, default to the dev
+// dashboard origin. `origin: true` (reflect any origin) was the prior behavior
+// and is what F-15 closes — the API serves tenant data and should not respond
+// to cross-origin requests from arbitrary sites. NOTE: this is the *API
+// server's* CORS — the static dashboard server (`npx serve --cors` on port
+// 3000) is a separate process and its CORS configuration is unrelated.
+const allowedOrigins = (process.env.CORS_ORIGINS ?? 'http://localhost:3000')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
 app.register(cors, {
-  origin: true,
+  origin: allowedOrigins,
   methods: ['GET', 'POST', 'PATCH', 'DELETE'],
   allowedHeaders: ['Content-Type', 'X-Tenant-Id', 'X-User-Id', 'X-User-Role'],
 });

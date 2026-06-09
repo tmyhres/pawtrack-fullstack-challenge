@@ -84,7 +84,7 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 | F-12 | Wrong status codes — 404 returns 200, errors return 200 | api-design | medium | both | ☑ |
 | F-13 | Frontend branches on `result.error`, ignores HTTP status entirely | api-design, ux | medium | static | ☑ |
 | F-14 | `X-User-Role` is trusted unvalidated; no role enforcement anywhere | security, architecture | medium | static | ☐ |
-| F-15 | CORS `origin: true` allows any origin | security | medium | static | ☐ |
+| F-15 | CORS `origin: true` allows any origin | security | medium | both | ☑ |
 | F-16 | `scheduledDate` timezone-inconsistent (seed mixes UTC + offset; client uses local→UTC) | data-integrity, architecture | medium | static | ☐ |
 | F-17 | `statusChangedBy` taken from `X-User-Id` header without validation — audit trail is forgeable | security, observability | medium | both | ☐ |
 | F-18 | Event bus has no error isolation — a throwing handler kills the loop | architecture, observability | low | static | ☐ |
@@ -372,10 +372,19 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 - **File(s):** `server/src/index.ts:10-14`
 - **Classification:** security
 - **Severity:** medium
-- **Verified:** static
+- **Verified:** both
 - **What:** `origin: true` reflects the request origin → any browser tab on any site can call the API.
 - **Why it matters:** Combined with header-auth (no cookies / `credentials: 'include'`), the practical attack surface is smaller, but a hostile site can still issue cross-origin requests if it knows or guesses identifiers. Should be locked to the dashboard origin(s).
-- **Fix (Phase 2):** _pending_
+- **Fix (Phase 2):** API CORS now allows a comma-separated list sourced from `process.env.CORS_ORIGINS`, defaulting to `http://localhost:3000`. The `cors` plugin returns `Access-Control-Allow-Origin` only when the request's `Origin` is in the list; non-matching origins receive no allow header and the browser blocks the request.
+
+  **Verified at runtime:**
+  - OPTIONS preflight from `http://localhost:3000` → `204` with `access-control-allow-origin: http://localhost:3000`
+  - OPTIONS preflight from `http://evil.example` → `204` **without** the allow-origin header
+  - Real GET from `http://localhost:3000` → `200` with allow-origin echoed ✅
+
+  **⚠️ Foot-gun: the dashboard's static-asset server is a separate concern.** The README's Getting Started uses `npx serve client -l 3000 --cors`, which sets `Access-Control-Allow-Origin: *` on the **static asset server** (port 3000) — *not* on the API server (port 3001). F-15 only changes the API. If someone copies the README command into a production deployment script, the static dashboard host will keep the wildcard CORS, and any browser tab on any origin will be able to fetch the dashboard's HTML/JS/CSS bundle. Today the bundle is public assets only, so the impact is low — but the moment anyone serves user-specific or environment-specific data through that static host (a config file with tenant info baked in, a debug page, a `.env`-derived JS constant) the wildcard CORS becomes an exfil vector. Production deployments should serve the dashboard via a proper static host (nginx, CDN, managed hosting) without the wildcard, with CORS scoped to the same origin as the API or omitted entirely.
+
+  **Production deployment of the API:** set `CORS_ORIGINS` to a comma-separated list of dashboard origins (e.g. `CORS_ORIGINS=https://dashboard.pawtrack.example,https://admin.pawtrack.example`). The default of `http://localhost:3000` is dev-only.
 
 ### F-16 — `scheduledDate` timezone-inconsistent across seed and client
 
