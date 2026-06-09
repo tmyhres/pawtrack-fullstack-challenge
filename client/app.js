@@ -25,6 +25,14 @@ let filters = {
 // without it, a slow poll response can overwrite a freshly-filtered list.
 let currentFetchId = 0;
 
+// Extract the most useful error string from a JSON error response. Fastify
+// schema-validation errors put the detail in `message` (with a generic
+// `error: "Bad Request"`), while our handlers send `{ error }`. Prefer
+// `message`, then `error`, then a status-coded fallback.
+function errorText(result, response, fallback) {
+  return (result && (result.message || result.error)) || `${fallback} (${response.status})`;
+}
+
 // ============================================
 // Initialization
 // ============================================
@@ -103,7 +111,7 @@ async function fetchBookings(currentFilters) {
     loadingEl.style.display = 'none';
 
     if (!response.ok) {
-      errorEl.textContent = result.error || `Request failed (${response.status})`;
+      errorEl.textContent = errorText(result, response, 'Request failed');
       errorEl.style.display = 'block';
       return;
     }
@@ -218,7 +226,7 @@ async function transitionStatus(bookingId, newStatus) {
       showToast(`Booking updated to ${newStatus.replace('_', ' ')}`, 'success');
       fetchBookings(filters);
     } else {
-      showToast(result.error || `Failed to update status (${response.status})`, 'error');
+      showToast(errorText(result, response, 'Failed to update status'), 'error');
     }
   } catch (err) {
     showToast('Network error. Please try again.', 'error');
@@ -343,7 +351,7 @@ async function createBooking() {
       form.reset();
       fetchBookings(filters);
     } else {
-      showToast(result.error || result.message || `Failed to create booking (${response.status})`, 'error');
+      showToast(errorText(result, response, 'Failed to create booking'), 'error');
     }
   } catch (err) {
     showToast('Network error. Please try again.', 'error');

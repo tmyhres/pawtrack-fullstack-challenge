@@ -1,20 +1,23 @@
 import type { Booking, Pet, Sitter, Tenant } from '../types/index.js';
 import { tenants as seedTenants, pets as seedPets, bookings as seedBookings, sitters as seedSitters } from './seed.js';
 
-const ONE_DAY_MS = 24 * 60 * 60 * 1000;
-
 /**
  * Build the concrete [start, end) instant interval for a booking. Overnight
  * bookings — where endTime is lex-less than startTime (e.g. 23:30 → 00:30) —
  * roll the end into the next day. Lex comparison is safe because both fields
  * are validated to the strict `HH:MM` format in the route's body schema (F-08).
+ *
+ * The rollover advances the calendar date (setDate) rather than adding a fixed
+ * 24h in milliseconds: across a DST transition a local day is 23 or 25 hours,
+ * so `+86_400_000ms` would shift the end's wall-clock time by an hour and
+ * skew overlap detection on those nights.
  */
 function bookingInterval(b: Booking): { start: Date; end: Date } {
   const [date] = b.scheduledDate.split('T');
   const start = new Date(`${date}T${b.startTime}`);
-  let end = new Date(`${date}T${b.endTime}`);
+  const end = new Date(`${date}T${b.endTime}`);
   if (b.endTime < b.startTime) {
-    end = new Date(end.getTime() + ONE_DAY_MS);
+    end.setDate(end.getDate() + 1);
   }
   return { start, end };
 }

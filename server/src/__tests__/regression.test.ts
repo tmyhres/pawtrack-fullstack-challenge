@@ -209,6 +209,15 @@ describe('F-11 — date filter respects the tenant timezone, not UTC prefix', ()
     expect(apr8Ids).toContain('booking_006');
     expect(apr9Ids).not.toContain('booking_006');
   });
+
+  it('a corrupted tenant timezone falls back to UTC instead of 500ing', async () => {
+    // No API writes tenant.timezone, but guard the list endpoint against bad
+    // data: an invalid IANA zone must not crash the date filter (Copilot review).
+    const tenant = store.getTenant('tenant_portland')!;
+    tenant.timezone = 'Mars/Phobos';
+    const res = await app.inject({ method: 'GET', url: '/api/bookings?date=2026-04-09&page=1&limit=20', headers: PORTLAND });
+    expect(res.statusCode).toBe(200);
+  });
 });
 
 describe('F-12 — HTTP status codes express outcome', () => {
