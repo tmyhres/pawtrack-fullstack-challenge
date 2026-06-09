@@ -74,7 +74,7 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 | F-02 | `GET /api/bookings/:id` performs no tenant check | tenancy | critical | both | ☑ |
 | F-03 | `PATCH /api/bookings/:id/status` performs no tenant check | tenancy, data-integrity | critical | both | ☑ |
 | F-04 | `POST /api/bookings` does not verify pet/sitter belong to caller's tenant | tenancy, data-integrity | critical | both | ☑ |
-| F-05 | XSS via `innerHTML` interpolation of booking & pet fields | security | critical | both | ☐ |
+| F-05 | XSS via `innerHTML` interpolation of booking & pet fields | security | critical | both | ☑ |
 | F-06 | Double-booking race — overlap check has TOCTOU window | data-integrity | critical | both | ☑ |
 | F-07 | Pagination off-by-one (`offset = page * limit`) drops first page | data-integrity, ux | high | both | ☐ |
 | F-08 | No request body validation on `POST /api/bookings` or `PATCH …/status` | data-integrity, api-design | high | both | ☐ |
@@ -152,10 +152,18 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 - **File(s):** `client/app.js:115-139`
 - **Classification:** security
 - **Severity:** critical
-- **Verified:** static (seed already contains payload `<img src=x onerror="alert(1)">` in `pet_005.notes`)
+- **Verified:** both — Phase 1b proof was `document.title === 'XSS_FIRED'` from a stored payload
 - **What:** `container.innerHTML = bookings.map(b => \`…${b.notes}…${b.petId}…\`)` injects untrusted strings into HTML. Pet notes (rendered as part of booking cards once we link them) and any free-text from the server reaches the DOM unsanitised.
 - **Why it matters:** Stored XSS in a multi-tenant admin dashboard. A tenant member with write access (or a malicious owner-supplied note field) can run JS in the session of any staff member who views the board.
-- **Fix (Phase 2):** _pending_
+- **Fix (Phase 2):** Rewrote `renderBookings` to construct each card with explicit DOM nodes (`document.createElement` + `textContent`) instead of an `innerHTML = bookings.map(...).join('')` template literal. Every untrusted field (`booking.notes`, `booking.petId`, `booking.sitterId`, time strings, status) is set via `textContent`, which assigns the value as literal text — `<img onerror=...>` becomes the visible string `<img onerror=...>`, not an `<img>` element.
+
+  **Wiring change as a bonus:** the status-transition buttons no longer pass the booking id and target status through `data-*` attributes that have to be reparsed by a `querySelectorAll(...)` after the fact. Each button is wired up at construction time via closure capture — `btn.addEventListener('click', () => transitionStatus(booking.id, status))`. Smaller surface area, no escape concerns, no string round-trip.
+
+  **Trade-off:** the seed's `booking_005` note contains a literal `<b>Owner traveling until 4/15</b>` that *was* rendering as bold under the broken implementation. After the fix it appears as the literal string `<b>Owner traveling…`. That's a deliberate UX regression — the fix is to render markdown safely (or define an allow-listed inline-tag policy) if formatted notes are a real product requirement. Captured as a candidate for the Phase 3 improvements list, not done here.
+
+  **Out of scope today:** `renderPagination` still uses `innerHTML` with inline `onclick` handlers (F-19, low severity). The values it interpolates are server-side numbers (`page`, `totalPages`), not user-content, so no XSS vector — but it's still poor practice and noted for the sweep. Did not touch it in this commit to keep the diff focused.
+
+  **Verified:** the same Playwright probe that flipped `document.title` to `XSS_FIRED` in Phase 1b now reports `xssFired: false`, `document.title` unchanged, no `<img>` element constructed in the booking-notes DOM, and the payload string appears as literal text in `textContent`. ✅
 
 ### F-06 — Double-booking race — overlap check has TOCTOU window
 
