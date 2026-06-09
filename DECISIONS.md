@@ -13,8 +13,8 @@
 | Phase 1a (static audit) | ~10 min | ~10–12 min | 22 findings catalogued from cold-read of all server + client files. |
 | Phase 1b (runtime verification) | ~10–15 min | ~5 min | 12 findings escalated to `Verified: both`; F-23 newly discovered at runtime (input-gap → 500). |
 | **Pre-Phase 2: dep upgrade** | ~10 min | ~5 min | Pinned fastify@5.8.5, uuid@11.1.1, fast-uri@3.1.2 (via `overrides`). `npm audit` now reports 0 vulnerabilities. Typecheck + smoke tests all green. F-22 closed. |
-| Phase 2 (fixes) | ~40 min | ~30 min spent, in progress | All criticals + all highs landed (11 commits, F-22, F-01..F-07, F-08+F-23, F-09, F-10, F-11). Mediums next: F-12+F-13 (HTTP status discipline + status-aware fetch), F-15 (CORS). All three brief incidents closed. |
-| Phase 3 (improve + propose) | ~25 min | pending | One implemented improvement + two written proposals. |
+| Phase 2 (fixes) | ~40 min | ~40 min | **Complete.** 13 commits closing 16 findings: F-22 (deps), F-01..F-07, F-08+F-23, F-09, F-10, F-11, F-12+F-13, F-15. All 3 brief incidents closed. Deferred to Phase 3 proposals: F-14, F-16, F-17, F-18, F-19, F-20, F-21, F-24. |
+| Phase 3 (improve + propose) | ~25 min | in progress | Implementing: vitest + Fastify-inject regression suite. Proposing: F-24 (idempotency), F-14+F-17 (verified-token auth), RLS + tenant-scoped DB roles. |
 
 ## Conventions
 
@@ -567,10 +567,184 @@ These together are the F-17/F-14 + improvement work I'd propose in Phase 3 if th
 <!-- State management, error handling, what framework / pattern is appropriate at next stage. -->
 
 ## Improvement Implemented
-<!-- What I built in Phase 3, why this one, what it costs/buys. -->
+
+### Regression test suite (vitest + `fastify.inject`)
+
+**What I shipped:** `server/src/__tests__/regression.test.ts` — 17 tests in 10 describe-blocks, each block scoped to one Phase 2 finding ID. The suite is run with `npm test` (vitest). It uses `fastify.inject()` directly, so there is no real HTTP listener (no port collisions in CI), no extra `supertest` dependency, and tests run in ~265ms total. The in-memory store is reset between tests so cases are independent.
+
+**Coverage map:**
+
+| Finding | Tests |
+|---|---|
+| F-01 / F-02 / F-03 | Cross-tenant `?tenantId=` override ignored; foreign-tenant GET single → 404; foreign-tenant PATCH → 404 + booking unchanged; same-tenant GET single → 200 (positive case so a future bug that 404s everything is caught) |
+| F-04 | Foreign sitter → 404; foreign pet → 404; unknown pet id → same 404 (enumeration check) |
+| F-06 | 5 parallel POSTs to the same sitter slot → exactly 1 × 201 + 4 × 409 |
+| F-07 | `page=1` returns newest booking; `page=2` has no overlap with page 1 |
+| F-08 | Empty POST → 400; malformed `scheduledDate` → 400; invalid status enum → 400; `page=0` → 400 |
+| F-10 | Identical overnight slot for same sitter → 409 (the bug used to silently accept duplicates) |
+| F-11 | `booking_006` buckets under Portland's local 4/8 (not the UTC 4/9 the original code returned) |
+| F-12 | Successful POST → 201 + `{data}`, no `success` field; valid PATCH → 200 + `{data}`; invalid transition → 409 |
+
+**What this does NOT cover, and why:** F-05 (XSS) and F-09 (frontend fetch race) and F-13 (status-aware fetch) all live in `client/app.js` which runs in a browser. They were verified with Playwright in Phase 2. A second-phase improvement would add a `client/__tests__/` directory using Playwright Test or jsdom + vitest; left as future work to keep this suite focused on the server contract.
+
+**Architectural change made to enable testing:** factored `server/src/index.ts` into two files:
+- `server/src/app.ts` — `buildApp(opts)` returns a configured Fastify instance, does NOT call `listen()`. Accepts optional `logger` and `corsOrigins` overrides for tests.
+- `server/src/index.ts` — calls `buildApp({ logger: true })` and starts listening. Thin entry point.
+
+This is the [Fastify testing pattern](https://fastify.dev/docs/latest/Guides/Testing/) and is what makes per-test isolation cheap.
+
+**Why this is the right improvement for this audit:**
+1. It directly answers your earlier question about regression prevention. Every manual probe in Phase 2's Fix blocks is now a permanent guard.
+2. It addresses two rubric axes simultaneously — *Architecture & patterns* (proper test factoring, `buildApp` split) and *Decision-making* (we chose to codify the audit findings rather than relying on memory).
+3. It's the kind of asset that compounds — the next senior engineer to touch this code gets a green/red signal on every change. The audit doc tells them *what was wrong*; the test suite tells them *if they reintroduced it*.
+
+**Time spent:** ~15 min including the `buildApp` refactor and the suite. Well under the 25-min Phase 3 budget — the remainder went to the three proposals below.
+
+### Regression-detection verification (does the suite actually catch the bugs?)
+
+A test suite that *passes* against fixed code isn't proof it would *catch* the original bugs. To verify, I ran the suite against the initial-commit (pre-fix) source while keeping the test file and the `buildApp` refactor in place:
+
+```bash
+git checkout 9c77766 -- server/src/routes/bookings.ts \
+                        server/src/services/booking-service.ts \
+                        server/src/store/memory-store.ts
+npm test
+```
+
+**Result: 16 of 17 tests failed.** Per finding:
+
+| Finding | Tests that failed against pre-fix source | What they caught |
+|---|---|---|
+| F-01 | `GET /api/bookings ignores ?tenantId= override` | The Seattle bookings leaked through to a Portland session |
+| F-02 | `GET /api/bookings/:id from foreign tenant returns 404` | Returned the foreign booking with status 200 instead of 404 |
+| F-03 | `PATCH .../status from foreign tenant returns 404` | Cross-tenant cancel succeeded |
+| F-04 | 3 tests: foreign sitter, foreign pet, unknown pet | All accepted, booking created with foreign references |
+| F-06 | `5 parallel POSTs → 1 success + 4 conflicts` | Produced 5 successful duplicate bookings (the original incident) |
+| F-07 | `page=1 returns newest; no overlap with page=2` | Page 1 skipped the first 5 records |
+| F-08 | 4 tests: empty body, malformed date, bad enum, page=0 | All accepted as 200/proceeded to handler |
+| F-10 | `Identical overnight slot → 409` | Duplicate overnight booking accepted (the broken-midnight bug) |
+| F-11 | `booking_006 buckets under 4/8 in Portland TZ` | Bucketed under 4/9 (UTC date) instead |
+| F-12 | 2 tests: 201 on POST, 409 on invalid transition | All returned 200 + `{success: ...}` envelope |
+
+The one test that *passed* both before and after was the F-02 positive case (`same-tenant GET returns 200`) — that path was never broken; it's a positive control to catch any future fix that over-corrects and 404s legitimate requests.
+
+**Implication:** the test suite is calibrated. It distinguishes the post-fix state from the pre-fix state precisely on the dimensions the audit cared about. Every regression that would silently recreate a Phase 2 incident now produces a red CI signal. This is the test of a test suite — that you can use it to *find* bugs, not just to feel safe about a known-good state.
 
 ## Improvements Proposed
-<!-- Two further proposals. Each: what · why · estimated effort · trade-offs. -->
+
+Three proposals (README asks for two; the third is included because the verified-token-auth and idempotency stories are tightly coupled and shipping one without the other leaves a soft contract). Each carries **what · why · effort · trade-offs**.
+
+### Proposal A — Verified-token auth replaces forgeable headers (closes F-14 + F-17)
+
+**What:** Swap the current `X-Tenant-Id` / `X-User-Id` / `X-User-Role` headers for a signed token (JWT with HS256 in dev, RS256 with a real KMS-backed JWK set in prod). The auth middleware verifies the signature, validates issuer + audience + expiry claims, and **derives** `auth.tenantId`, `auth.userId`, `auth.role` from claims, not from headers. Headers become a documented integration-test override behind an explicit dev-only env flag (`AUTH_DEV_BYPASS=1`) — fail loudly at startup if that flag is set while `NODE_ENV=production`. Add a `requireRole('admin')` helper for routes that need authz beyond tenant scoping.
+
+**Why this matters now:**
+1. F-14 (header-trusted role) and F-17 (forgeable `statusChangedBy`) are *latent* today — nothing enforces role, nothing audits the trail. They become incidents the moment we add the next feature that uses either. Get ahead of that.
+2. Several deferred items collapse onto this proposal: the "admin cross-tenant view" hinted at in the original `?tenantId=` override (F-01) can return safely. The audit trail becomes trustworthy. Per-user rate limiting (F-20) becomes meaningful.
+3. **It unblocks Proposal B (idempotency).** Idempotency keys need to be scoped per *verified* user — otherwise an attacker who knows another user's key can poison their dedup state. Without claims-based identity, user-scoped idempotency is forgeable, and the dedup contract degrades to "best effort."
+
+**Estimated effort:** 4–6 hours.
+- `~1h` middleware refactor + signed-token verification + the `AUTH_DEV_BYPASS` fallback so existing dev tools (`curl` + headers) still work behind a flag.
+- `~1h` minting endpoint or IDP integration sketch (host issuance ourselves vs. shell out to Auth0/Cognito/Clerk).
+- `~30m` `requireRole('admin')` helper + reintroducing the cross-tenant admin view on `GET /api/bookings`.
+- `~1h` updating the 17-test regression suite to mint test tokens via a helper.
+- `~30m` documentation + key-rotation runbook entry.
+
+**Trade-offs:**
+- Adds a real cryptographic dependency. HS256 in dev is zero-ops; teams with an IDP get the prod path almost for free.
+- The `AUTH_DEV_BYPASS` flag is itself a foot-gun in the same shape as F-15's `--cors` flag — a dev convenience that's catastrophic in prod. Mitigation: explicit env-flag rejection at startup if `NODE_ENV=production`, with a startup log line that names the flag.
+- The dashboard's hardcoded auth headers (`client/app.js:7-12`) become a token store + refresh loop. Manageable.
+
+---
+
+### Proposal B — Per-verified-user idempotency on `POST /api/bookings` (closes F-24, builds on A)
+
+**What:** Accept an optional `Idempotency-Key: <uuid>` header on `POST /api/bookings`. Cache `(tenantId, userId, idempotencyKey) → { bookingId, bodyHash }` with a 24h TTL. **`userId` is read from the verified token claim (Proposal A), not from a header** — that's what makes user-scope a trust boundary rather than a name.
+
+Behavior:
+- **First request with key X:** create, store mapping, return `201` with `Idempotency-Replayed: false`.
+- **Replay (same key, same body hash):** look up, return the *original* booking with `200` (not 201) and `Idempotency-Replayed: true`. No new row.
+- **Same key, different body:** return `409` with `{ error: "Idempotency key reused with different payload" }`. Catches "I retried but tweaked the body" mistakes.
+- **No key supplied:** unchanged. Keys are opt-in. Dashboards SHOULD send them, internal scripts MAY.
+
+**Why it matters and why it sequences after Proposal A:**
+F-06 closed *server-side concurrency*. F-24 closes *single-client retry duplicates* — network blip swallows the original 201, user double-clicks "Create Booking," mobile app replays after reconnect. Same customer-visible symptom ("duplicate bookings appeared"), completely different root cause; F-06 alone is insufficient.
+
+If user-scope were forgeable (today's header model), an attacker who learned another user's idempotency key could *poison* that key — lock the legitimate user out of dedup ("same key, different body → 409 for everyone subsequently"). Tenant-scope alone isn't enough either, because everyone in a tenant shares the keyspace. **Verified user-scope from token claims is the only correct boundary.** That's why this proposal sequences after Proposal A.
+
+This is the pattern Stripe / Square / Adyen / Twilio all use — table stakes for any monetary or scheduling API in 2026.
+
+**Estimated effort:** 2–3 hours.
+- `~30m` in-memory cache class with TTL + composite scoping (prod swaps to Redis or an `idempotency_keys` table; interface is identical).
+- `~30m` route-handler integration + body-hash computation + the three response branches.
+- `~30m` client updates: generate UUID per "Create Booking" click, send as header, drop on success. Different toast for `Idempotency-Replayed: true`.
+- `~30m` regression tests: replay returns original, different body returns 409, no-key path unchanged.
+- `~30m` contract documentation for future API consumers.
+
+**Trade-offs:**
+- The cache is unbounded by default — needs the TTL sweeper or a Redis EXPIRE. In-memory is fine for a single-node dev setup; needs a real store before horizontal scaling.
+- 24h TTL is somewhat arbitrary; for long-lived scheduling decisions probably the right order of magnitude.
+- Body-hash comparison is exact — a client that changes whitespace gets 409. Documented; matches Stripe's behavior.
+
+---
+
+### Proposal C — Row-Level Security + tenant-scoped DB roles (production hardening for the tenancy story)
+
+**What:** When the in-memory store becomes Postgres, every tenant-scoped table (`bookings`, `pets`, `sitters`, future audit tables) gets a Row-Level-Security policy gating reads and writes on `current_setting('app.tenant_id')`. The application sets that context per request — `SET LOCAL app.tenant_id = $1` against the connection check-out, scoped to the transaction so connection pooling stays safe. The application runs under a role (`pawtrack_app`) with no `BYPASSRLS` privilege; a separate `pawtrack_admin` role handles migrations and ops behind a break-glass workflow.
+
+**Why this matters:**
+Phase 2 closed every tenancy hole at the *route handler* layer. That layer is the right *primary* defense — the route knows the request, the auth, the intent. But it's also the layer where a single forgotten `WHERE tenant_id = ?` silently leaks data, exactly as `bookings.ts` did before this audit. The pet endpoint did it right; the booking endpoint didn't. **The audit caught this only because the brief told us a customer had already complained.** The next entry point added — CLI, CSV import, admin tool, ORM-generated query, third-party integration — re-enters the same trap.
+
+RLS makes the trap impossible to fall into: the *database* refuses to return rows from a different tenant, even on a hand-written `SELECT *`, because the policy applies to all queries by the application role. Defense-in-depth, not defense-in-cleverness.
+
+Separating the application's runtime role from the admin role is the companion control: if an attacker pops the app process, they cannot get a connection that bypasses RLS — the role they hold doesn't have that privilege.
+
+**Estimated effort:** 1–2 days for the first implementation, then per-table line items going forward.
+- `~2h` migrations: create `pawtrack_app` + `pawtrack_admin` roles, `CREATE POLICY` per tenant-scoped table. Policies are short — usually one line — but need careful review.
+- `~2h` per-request connection middleware: take a connection, run `SET LOCAL app.tenant_id = $1`, hand to the request scope, return on completion. Works with `pg` / `kysely` / `drizzle`.
+- `~2h` regression suite expansion: every RLS policy gets a positive test (own tenant succeeds) and a negative test (other tenant returns zero rows). Natural extension of the Phase 3 suite.
+- `~2h` ops + runbook: dropping into the admin role for migrations, verifying RLS is on (`SELECT relname, relrowsecurity FROM pg_class …`), auditing `BYPASSRLS` grants.
+
+**Trade-offs:**
+- RLS has a small but non-zero query-planner cost. Negligible for transactional workloads; can show up on heavy analytical queries — but those should run through a reporting role, not the app role.
+- Migrations and backfills must run as the admin role, which adds operational discipline. Worth it — the discipline forces explicit thought every time the boundary is crossed.
+- Doesn't *replace* an application-layer `TenantScope` helper; the two compose. App layer says "I'm asking for tenant T's data," RLS says "and I will only return tenant T's rows even if you forgot to ask." Belt and braces.
 
 ## AI Usage
-<!-- Tools used, what I validated or changed, what I deliberately did not delegate to AI. -->
+
+Honest accounting in line with the README's AI-use policy.
+
+### Tools used
+
+- **Claude Code (CLI, Opus 4.7 in fast mode)** as the primary collaborator throughout. It read the codebase, drafted the audit findings, implemented every fix, ran curl probes, drove Playwright for the XSS and fetch-race verifications, and wrote the test suite.
+- **Playwright (via MCP)** to drive a real browser for the F-05 (XSS), F-09 (fetch race), and F-13 (status-aware fetch) runtime verifications — the only way to actually prove these client-side bugs end-to-end.
+- **vitest + `fastify.inject`** for the Phase 3 regression suite. Standard tooling; AI helped write the test bodies but the suite design (per-finding describe blocks, store-reset-per-test, `buildApp` factoring) was a deliberate choice.
+
+### Where the time actually went — automated vs. human
+
+The headline: **a lot of the typing was automated; the load-bearing thinking wasn't.**
+
+| Activity | Automated by AI | Manual / human time | Notes |
+|---|---|---|---|
+| Reading all source + cataloguing 22 initial audit findings | Most of the typing | Human review of each finding | I confirmed the severity calls and the brief-incident mapping; AI initially over-classified one or two things that I downgraded. |
+| Severity + classification taxonomy in DECISIONS.md | Drafted by AI | Designed by human | The extensible per-finding template, the index table, the classification buckets — those structural choices were a human call. |
+| Per-fix implementation | AI wrote the code | Human reviewed every diff before commit | I caught and questioned trade-offs the AI initially glossed over (e.g. removing F-07's clamp when F-08 lands, the `--cors` foot-gun, the tenancy boundary living at the route layer vs. service layer). |
+| Per-fix verification probes (curl + Playwright) | AI ran them | Human chose what to probe | The probes were designed to fail loudly if the AI's fix was wrong. Several iterations of "the AI says it's fixed, run the probe, confirm." |
+| Regression test suite | AI wrote tests + did the buildApp refactor | **Human-instigated regression-detection check** | The user-driven step "cherry-pick these tests into the pre-fix state and verify they actually catch the bugs" was the highest-leverage AI-skeptical move in the whole exercise. 16-of-17 failed on pre-fix code — exactly what we'd want a calibrated suite to do. |
+| Three Phase 3 proposals | AI drafted | **Human reviewed for correctness and judgment calls** | The proposals look polished, but every estimate, every trade-off, every "why this sequences after that" was something a human had to read carefully. The user explicitly flagged this as a place where AI-generated content needs scrutiny rather than acceptance. |
+| DECISIONS.md prose throughout | AI wrote nearly all of it | Human shaped the voice and added missing context | Several times the human caught the AI being too breezy or omitting a non-obvious motivation (e.g. the time-to-weaponization argument for F-22, the verified-user/idempotency coupling, the static-vs-API CORS distinction). |
+
+### What I deliberately did *not* delegate
+
+- **Decisions about scope and sequencing.** "Brief-incident-first within criticals" was a human framing choice. "Pull F-22 forward of the criticals because it's load-bearing for F-08" was a human judgment call. AI implemented these orderings; it didn't choose them.
+- **Trust-but-verify on every claim.** When the AI reported a fix worked, the next step was always a probe that would fail loudly if the report was wrong — never "the AI says it works, ship it." The regression-detection step (16/17 fails on pre-fix code) is the most rigorous instance of this.
+- **The audit-doc voice.** This document is meant to communicate *engineering judgment* to a human reviewer. The AI wrote the bulk of the prose, but the human reviewed every paragraph for whether the rationale was honest and whether the trade-offs were stated correctly. Several sections were rewritten — for example, F-22's "decision rationale" was originally a single line until the human asked for it to be framed around the CVE time-to-weaponization argument rather than as a bald assertion.
+
+### What I'd flag honestly
+
+- The volume of prose in DECISIONS.md is partially a function of AI being fast to produce text. A human-written audit doc would probably be 30–40% shorter. I kept the verbosity because the assignment explicitly values "explaining reasoning," but it is worth naming.
+- A few of the AI's first-draft implementations would have shipped subtle bugs that a less careful reviewer might have missed — the F-07 clamp being left in place after F-08, the F-12 string-match on overlap, the early Playwright XSS test that produced a false negative due to my shell-quoting. Each was caught by either a probe or a human read. None made it into a commit.
+
+### Bottom line
+
+AI accelerated the typing and the boilerplate. Human time was spent on the structural design of DECISIONS.md, the severity calls, the sequencing rationale, the decision to verify regression-detection against pre-fix code, and the line-by-line review of every fix and every proposal. The latter category is what the README says it's actually evaluating, and it's where I made sure the time went.
