@@ -15,6 +15,7 @@
 | **Pre-Phase 2: dep upgrade** | ~10 min | ~5 min | Pinned fastify@5.8.5, uuid@11.1.1, fast-uri@3.1.2 (via `overrides`). `npm audit` now reports 0 vulnerabilities. Typecheck + smoke tests all green. F-22 closed. |
 | Phase 2 (fixes) | ~40 min | ~40 min | **Complete.** 13 commits closing 16 findings: F-22 (deps), F-01..F-07, F-08+F-23, F-09, F-10, F-11, F-12+F-13, F-15. All 3 brief incidents closed. Deferred to Phase 3 proposals: F-14, F-16, F-17, F-18, F-19, F-20, F-21, F-24. |
 | Phase 3 (improve + propose) | ~25 min | in progress | Implementing: vitest + Fastify-inject regression suite. Proposing: F-24 (idempotency), F-14+F-17 (verified-token auth), RLS + tenant-scoped DB roles. |
+| **Phase 4 (post-review hardening)** | n/a (review follow-up) | ~30 min | Two review passes after submission. **Copilot** flagged the DST `+24h` overnight rollover (F-25) and the per-row / RangeError-prone date formatter (F-26). **Peer review** escalated F-16 (deferred medium) to high: the client's UTC-midnight `scheduledDate` filed bookings under the previous local day *and* let a client-shaped overnight slot dodge the overlap check — reopening F-06/F-11 through the client path. All three fixed across commits `196ed34` + `f5dd96a`; service-date logic unified into `util/dates.ts`; regression suite 17 → 20 tests. |
 
 ## Conventions
 
@@ -85,7 +86,7 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 | F-13 | Frontend branches on `result.error`, ignores HTTP status entirely | api-design, ux | medium | static | ☑ |
 | F-14 | `X-User-Role` is trusted unvalidated; no role enforcement anywhere | security, architecture | medium | static | ☐ |
 | F-15 | CORS `origin: true` allows any origin | security | medium | both | ☑ |
-| F-16 | `scheduledDate` timezone-inconsistent (seed mixes UTC + offset; client uses local→UTC) | data-integrity, architecture | medium | static | ☐ |
+| F-16 | `scheduledDate` timezone-inconsistent (seed mixes UTC + offset; client uses local→UTC) | data-integrity, architecture | high | both | ☑ |
 | F-17 | `statusChangedBy` taken from `X-User-Id` header without validation — audit trail is forgeable | security, observability | medium | both | ☐ |
 | F-18 | Event bus has no error isolation — a throwing handler kills the loop | architecture, observability | low | static | ☐ |
 | F-19 | Inline `onclick` + `window.goToPage` global for pagination | security, ux | low | static | ☐ |
@@ -94,6 +95,8 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 | F-22 | Three known CVEs in pinned deps (fastify, fast-uri, uuid); `npm audit` reports fixes available | security | medium | static | ☑ |
 | F-23 | Bad input (F-08) crashes list endpoint with HTTP 500 when `date` filter applied | data-integrity, availability | high | runtime | ☑ |
 | F-24 | No idempotency on `POST /api/bookings` — client retry / double-click creates duplicate bookings | data-integrity, api-design | medium | static | deferred (Phase 3 proposal) |
+| F-25 | Overnight overlap rolls end via fixed `+24h` ms — wrong by ±1h on DST nights | data-integrity | low | both | ☑ |
+| F-26 | Date-filter formatter rebuilt per row + 500s on an invalid tenant timezone | data-integrity, availability, performance | low | both | ☑ |
 
 <!-- Per-finding blocks below this line -->
 
@@ -275,11 +278,11 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 - **Verified:** both
 - **What:** Overlap computes `new Date(\`${date}T${endTime}\`)` for an end time that is on the next day, producing `existingEnd < existingStart`. The `newStart < existingEnd && newEnd > existingStart` predicate then misbehaves.
 - **Why it matters:** Overnight care is a real use case (already in the seed — `booking_006` and `booking_011`) and overlap checking silently fails for it.
-- **Fix (Phase 2):** Extracted a `bookingInterval(b)` helper inside the store module that builds `{ start, end }` from `scheduledDate + startTime + endTime`. When `endTime < startTime` (lex comparison — safe because both fields are validated to strict `HH:MM` format by the F-08 schema), the end Date is rolled into the next day with `+ ONE_DAY_MS`. The atomic create method (`tryCreateBookingForSitter`) now uses this helper for *both* the candidate and each existing booking. Same-day bookings produce the same intervals as before (`endTime ≥ startTime` skips the +24h branch), so this is purely additive.
+- **Fix (Phase 2):** Extracted a `bookingInterval(b)` helper inside the store module that builds `{ start, end }` from `scheduledDate + startTime + endTime`. When `endTime < startTime` (lex comparison — safe because both fields are validated to strict `HH:MM` format by the F-08 schema), the end Date is rolled into the next day (originally `+ ONE_DAY_MS`; changed post-review to `setDate(getDate()+1)` for DST-safety — see F-25). The atomic create method (`tryCreateBookingForSitter`) now uses this helper for *both* the candidate and each existing booking. Same-day bookings produce the same intervals as before (`endTime ≥ startTime` skips the +24h branch), so this is purely additive.
 
   **Why a helper at the store level and not in the service:** the helper expresses the booking-interval-as-instants invariant where the overlap check lives. F-06 already pushed atomicity into the store; F-10 extends that by making the time-interval computation a shared, named function instead of a copy-pasted snippet. Future tests can import and assert against `bookingInterval` directly.
 
-  **Out of scope here (covered by F-11/F-16):** the helper uses `new Date('YYYY-MM-DDTHH:MM')` which interprets the time in the *Node process's local* timezone — not the *tenant's* timezone. So a booking that "feels like" 23:30 Pacific stored with a UTC scheduledDate will produce intervals in the process timezone, not the tenant's. The F-10 fix is correct *relative to itself* (two bookings with the same convention overlap consistently), but the absolute wall-clock placement is the F-11/F-16 problem. Noting here so it doesn't read as a regression.
+  **Out of scope here (covered by F-11/F-16):** the helper uses `new Date('YYYY-MM-DDTHH:MM')` which interprets the time in the *Node process's local* timezone — not the *tenant's* timezone. So a booking that "feels like" 23:30 Pacific stored with a UTC scheduledDate will produce intervals in the process timezone, not the tenant's. The F-10 fix is correct *relative to itself* (two bookings with the same convention overlap consistently), but the absolute wall-clock placement is the F-11/F-16 problem. Noting here so it doesn't read as a regression. **Post-review update (F-16):** resolved — `bookingInterval` now derives the day from the shared tenant-local `tenantLocalDate` helper, so overlap and the F-11 filter agree, and a client-shaped overnight slot no longer slips past the conflict check.
 
   **Verified:**
   - Phase 1b probe (identical overnight slot, same sitter) → now rejected with "Sitter has an overlapping booking for this time slot" ✓ (used to silently succeed)
@@ -305,7 +308,7 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 
   **Belt-and-braces:** the `typeof` and `Number.isNaN(instant.getTime())` checks protect against malformed `scheduledDate` rows arriving via a future ingestion path (same defensive posture as F-23).
 
-  **Acknowledged remaining limitation (F-16):** the seed itself stores `scheduledDate` in two different conventions — `…-07:00` offset for most rows and `Z` UTC for the late-night ones. The fix produces correct local dates regardless, but the underlying data model (a single instant plus a separate wall-clock `startTime/endTime`) is still inconsistent and will be the subject of F-16 if/when we touch the schema.
+  **Acknowledged remaining limitation (F-16):** the seed itself stores `scheduledDate` in two different conventions — `…-07:00` offset for most rows and `Z` UTC for the late-night ones. The fix produces correct local dates regardless, but the underlying data model (a single instant plus a separate wall-clock `startTime/endTime`) is still inconsistent and will be the subject of F-16 if/when we touch the schema. **Post-review update:** F-16 is now fixed — this projection logic lives in the shared `util/dates.ts` `tenantLocalDate` helper, used by both this filter and the overlap check so they can no longer disagree.
 
   **Verified:**
   - Portland `date=2026-04-08` → now includes `booking_006` (a 23:30 PT booking previously misfiled under 4/9) plus `booking_003`
@@ -351,7 +354,7 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 - **Fix (Phase 2):** All three client fetch paths now branch on `response.ok` first:
   - `fetchBookings`: on `!response.ok`, populate the error banner with `result.error || \`Request failed (${response.status})\``.
   - `transitionStatus`: on `!response.ok`, toast `result.error || \`Failed to update status (${response.status})\``.
-  - `createBooking`: on `!response.ok`, toast `result.error || result.message || \`Failed to create booking (${response.status})\``. The `result.message` fallback catches Fastify's schema-validation error body which uses `message` rather than `error` for the human-readable text.
+  - `createBooking`: on `!response.ok`, toast the server's error text. **Post-review refinement:** all three paths now share an `errorText(result, response, fallback)` helper that prefers Fastify's `message` (the human-readable schema-validation detail) over the generic `error` (`"Bad Request"`), then falls back to a status-coded string. The earlier ordering surfaced `"Bad Request"` and hid the useful detail.
 
   **What this is *not*:** RFC 7807 problem-details. The current `{ error: string }` shape is fine for an admin dashboard with a single consumer; full problem-details would be the right move once the API has third-party consumers. Captured as future work.
 
@@ -480,6 +483,43 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
   - Resolving F-22 before Step 8 means the schema-validation hardening (F-08) lands on a non-vulnerable fastify, so we don't briefly create a state where the *new* security feature is itself bypassable.
 
   Bias: when the upgrade is patch-version-only, the regression surface is small, and the audit context is fresh, default to upgrading. Reserve "defer" for when a fix forces a major-version bump with real breaking changes.
+
+### F-16 — `scheduledDate` timezone-inconsistent across seed and client
+
+> Originally catalogued at medium and deferred; **escalated to high and fixed in Phase 4** after peer review showed it reopens two named incidents through the client path. The full Fix block is recorded here (the audit-order block above remains for the static-audit narrative).
+
+- **File(s):** `server/src/store/seed.ts`, `client/app.js` (`createBooking`), `server/src/store/memory-store.ts` (`bookingInterval`), `server/src/services/booking-service.ts` (date filter), `server/src/util/dates.ts` (new)
+- **Classification:** data-integrity, architecture
+- **Severity:** high (escalated from medium)
+- **Verified:** both
+- **What:** The client computed `new Date(value).toISOString()` from an `<input type=date>` value → midnight-UTC, which is the *previous* evening in Pacific. The server held three disagreeing notions of a booking's day: the client's UTC-midnight, the F-11 filter's tenant-local-of-instant, and the overlap check's raw `scheduledDate.split('T')[0]`.
+- **Why it matters:** A booking created for "Apr 8" filed under Apr 7 in the day-view (F-11 reopened), and a client-shaped overnight slot dodged the overlap check — verified returning **201 where 409 was required** (F-06 / double-booking reopened). The data model conflates an instant with separate wall-clock `startTime`/`endTime`.
+- **Fix (Phase 4):** One canonical *service date* (the booking's tenant-local calendar day) used everywhere.
+  - New `server/src/util/dates.ts` exports `tenantLocalDate(scheduledDate, tz)` — the F-11 projection, now shared, cached per-tz, with the F-26 invalid-tz fallback.
+  - The list date-filter (`booking-service.ts`) and the sitter overlap check (`bookingInterval` in `memory-store.ts`) both derive the day from this helper, so they can no longer disagree regardless of how the instant was shaped.
+  - The client (`createBooking`) anchors submission at **noon UTC** (`${date}T12:00:00.000Z`) so the picked calendar day survives projection into any real tenant timezone (UTC-12 .. UTC+11) instead of slipping a day at UTC midnight.
+- **Verified:** end-to-end probes reproduced both failures, then both passed after the fix. Two regression tests added — "POST picked date → GET ?date=picked includes it" and "client-shaped overnight → 409" — calibrated by reverting the server fix (the overnight test flips back to 201). Suite 18 → 20 tests, green under `TZ` of `UTC`, `America/Los_Angeles`, and the host default. Commit `f5dd96a`.
+- **Deliberately not done:** the deeper model change (storing a true UTC instant from date+time+tenant-tz at write time, or making `scheduledDate` a date-only field) — a schema/data-migration beyond post-review scope. The canonical-service-date approach makes filter and overlap self-consistent without touching the stored shape.
+
+### F-25 — Overnight overlap rolls the end via fixed `+24h` ms — wrong by ±1h on DST nights
+
+- **File(s):** `server/src/store/memory-store.ts` (`bookingInterval`)
+- **Classification:** data-integrity
+- **Severity:** low
+- **Verified:** both (Copilot review + node repro)
+- **What:** The F-10 overnight roll added `86_400_000ms` to the end Date. A local calendar day across a DST transition is 23 or 25 hours, so `+24h` shifts the end's wall-clock by an hour (spring-forward → 06:00 instead of 05:00; fall-back → 04:00), skewing the overlap window on those nights.
+- **Why it matters:** Narrow edge — only overnight bookings, only the one or two DST-transition nights per year, only when the server runs a DST-observing timezone. But the fix is trivial and strictly more correct.
+- **Fix (Phase 4):** Replaced `new Date(end.getTime() + ONE_DAY_MS)` with `end.setDate(end.getDate() + 1)`, which advances the calendar date while preserving wall-clock time across DST. Confirmed by node repro (`2026-03-07T05:00` + a day → `05:00`, was `06:00`; fall-back night likewise). F-10's basic-overnight test stays green; a TZ-pinned DST test was judged not worth the determinism overhead given the self-evident fix. Commit `196ed34`.
+
+### F-26 — Date-filter formatter rebuilt per row + 500s on an invalid tenant timezone
+
+- **File(s):** `server/src/services/booking-service.ts` → `server/src/util/dates.ts`
+- **Classification:** data-integrity, availability, performance
+- **Severity:** low
+- **Verified:** both (Copilot review + regression test)
+- **What:** The F-11 filter constructed a fresh `Intl.DateTimeFormat` per booking row, and `?? 'UTC'` only guarded a *missing* timezone — an *invalid* IANA string (corrupted tenant data) throws `RangeError` and 500s the list endpoint, contradicting the function's own "better to bucket by UTC than 500" intent.
+- **Why it matters:** No API path writes `tenant.timezone` today, so it's defensive depth — but the stated contract was "never 500 on this," and the implementation didn't honour it.
+- **Fix (Phase 4):** Date logic consolidated into `util/dates.ts` (`tenantLocalDate`): one cached formatter per timezone, construction wrapped in `try/catch` → UTC fallback. Now the single source of truth for both the list filter and the overlap check (see F-16). Regression test mutates a tenant's timezone to `'Mars/Phobos'` and asserts the date filter returns 200, not 500. Commits `196ed34` (initial) + `f5dd96a` (consolidation).
 
 ---
 
