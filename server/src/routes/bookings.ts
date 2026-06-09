@@ -3,29 +3,42 @@ import type { AuthContext, BookingStatus } from '../types/index.js';
 import { bookingService } from '../services/booking-service.js';
 import { store } from '../store/memory-store.js';
 
+const BOOKING_STATUSES = ['requested', 'confirmed', 'in_progress', 'completed', 'cancelled'] as const;
+const TIME_HHMM = '^([01]\\d|2[0-3]):[0-5]\\d$';
+
 export function bookingRoutes(app: FastifyInstance): void {
   /**
    * GET /api/bookings
    * List bookings with optional filters and pagination.
    */
-  app.get('/api/bookings', async (request: FastifyRequest, reply: FastifyReply) => {
+  app.get('/api/bookings', {
+    schema: {
+      querystring: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          page: { type: 'integer', minimum: 1, default: 1 },
+          limit: { type: 'integer', minimum: 1, maximum: 100, default: 10 },
+          date: { type: 'string', format: 'date' },
+          status: { type: 'string', enum: BOOKING_STATUSES as unknown as string[] },
+        },
+      },
+    },
+  }, async (request: FastifyRequest, reply: FastifyReply) => {
     const auth = (request as any).auth as AuthContext;
     const query = request.query as {
-      page?: string;
-      limit?: string;
+      page: number;
+      limit: number;
       date?: string;
-      status?: string;
+      status?: BookingStatus;
     };
-
-    const page = parseInt(query.page || '1', 10);
-    const limit = parseInt(query.limit || '10', 10);
 
     const result = bookingService.listBookings({
       tenantId: auth.tenantId,
-      page,
-      limit,
+      page: query.page,
+      limit: query.limit,
       date: query.date,
-      status: query.status as BookingStatus | undefined,
+      status: query.status,
     });
 
     return reply.code(200).send(result);
@@ -52,7 +65,23 @@ export function bookingRoutes(app: FastifyInstance): void {
    * POST /api/bookings
    * Create a new booking.
    */
-  app.post('/api/bookings', async (request: FastifyRequest, reply: FastifyReply) => {
+  app.post('/api/bookings', {
+    schema: {
+      body: {
+        type: 'object',
+        required: ['petId', 'sitterId', 'scheduledDate', 'startTime', 'endTime'],
+        additionalProperties: false,
+        properties: {
+          petId: { type: 'string', minLength: 1, maxLength: 64 },
+          sitterId: { type: 'string', minLength: 1, maxLength: 64 },
+          scheduledDate: { type: 'string', format: 'date-time' },
+          startTime: { type: 'string', pattern: TIME_HHMM },
+          endTime: { type: 'string', pattern: TIME_HHMM },
+          notes: { type: 'string', maxLength: 2000 },
+        },
+      },
+    },
+  }, async (request: FastifyRequest, reply: FastifyReply) => {
     const auth = (request as any).auth as AuthContext;
     const body = request.body as {
       petId: string;
@@ -97,7 +126,18 @@ export function bookingRoutes(app: FastifyInstance): void {
    * PATCH /api/bookings/:id/status
    * Update the status of a booking.
    */
-  app.patch('/api/bookings/:id/status', async (request: FastifyRequest, reply: FastifyReply) => {
+  app.patch('/api/bookings/:id/status', {
+    schema: {
+      body: {
+        type: 'object',
+        required: ['status'],
+        additionalProperties: false,
+        properties: {
+          status: { type: 'string', enum: BOOKING_STATUSES as unknown as string[] },
+        },
+      },
+    },
+  }, async (request: FastifyRequest, reply: FastifyReply) => {
     const auth = (request as any).auth as AuthContext;
     const { id } = request.params as { id: string };
     const { status } = request.body as { status: BookingStatus };

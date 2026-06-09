@@ -33,10 +33,12 @@ export class BookingService {
 
     let bookings = store.getBookingsByTenant(tenantId);
 
-    // Filter by date if provided
+    // Filter by date if provided. The `typeof` guard is belt-and-braces: the
+    // POST schema (F-08) now rejects rows without a scheduledDate at the
+    // boundary, but if a malformed row ever sneaks in via a future ingestion
+    // path the filter should still return [], not crash with a 500 (F-23).
     if (date) {
-      // Match bookings on the requested date
-      bookings = bookings.filter(b => b.scheduledDate.startsWith(date));
+      bookings = bookings.filter(b => typeof b.scheduledDate === 'string' && b.scheduledDate.startsWith(date));
     }
 
     // Filter by status if provided
@@ -50,16 +52,15 @@ export class BookingService {
     const total = bookings.length;
     const totalPages = Math.ceil(total / limit);
 
-    // Pagination is 1-indexed in the API contract (client defaults to page=1).
-    // Defensive clamp against page < 1; full input validation lands with F-08.
-    const safePage = Math.max(1, page);
-    const offset = (safePage - 1) * limit;
+    // Pagination is 1-indexed; the route's querystring schema (F-08) rejects
+    // page < 1 at the boundary, so no defensive clamp is needed here anymore.
+    const offset = (page - 1) * limit;
     const paginatedBookings = bookings.slice(offset, offset + limit);
 
     return {
       data: paginatedBookings,
       total,
-      page: safePage,
+      page,
       limit,
       totalPages,
     };

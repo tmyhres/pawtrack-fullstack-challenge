@@ -61,7 +61,7 @@
 
 The default rule for Phase 2 is **fix by severity**: critical → high → medium → low. That's what the README asks for and it's the right framing because severity is a proxy for blast radius. The order in which fixes actually shipped deviates from a pure severity sort in two specific, justified ways:
 
-1. **F-22 (deps, classified medium) was pulled forward to run before any other fix.** Two reasons. First, the *time-to-weaponization* of a published CVE has compressed enough over the past few years that "currently not exploitable from our code" is a snapshot, not a property — treating CVE patches as low-priority until they bite is exactly the discipline that produces incidents. Second, the fastify body-schema-bypass advisory becomes *load-bearing* the moment we add schema validation in Step 8 (F-08), so F-22 is a precondition for F-08 shipping safely. Detail in the F-22 Fix block below.
+1. **F-22 (deps, classified medium) was pulled forward to run before any other fix.** Two reasons. First, the *time-to-weaponization* of a published CVE has compressed enough a that "currently not exploitable from our code" is a snapshot, not a property — treating CVE patches as low-priority until they bite is exactly the discipline that produces incidents. Second, the fastify body-schema-bypass advisory becomes *load-bearing* the moment we add schema validation in Step 8 (F-08), so F-22 is a precondition for F-08 shipping safely. Detail in the F-22 Fix block below.
 2. **Within the critical severity tier, ordering is "brief-incident-first."** The README names three production incidents (cross-tenant read, double-booking, filters resetting). All critical findings get fixed, but ones that map to those named incidents go first — both because they're the most-visible wins against the rubric and because the company has already felt the pain.
 
 **After F-22, every subsequent fix is in strict severity order**, with the intra-tier sorting above. No medium- or low-severity finding is fixed before a critical or high. If we run short on the 40-minute Phase 2 budget, the cut line is always at the bottom of the priority list — mediums get deferred to proposals, not skipped over.
@@ -77,7 +77,7 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 | F-05 | XSS via `innerHTML` interpolation of booking & pet fields | security | critical | both | ☑ |
 | F-06 | Double-booking race — overlap check has TOCTOU window | data-integrity | critical | both | ☑ |
 | F-07 | Pagination off-by-one (`offset = page * limit`) drops first page | data-integrity, ux | high | both | ☑ |
-| F-08 | No request body validation on `POST /api/bookings` or `PATCH …/status` | data-integrity, api-design | high | both | ☐ |
+| F-08 | No request body validation on `POST /api/bookings` or `PATCH …/status` | data-integrity, api-design | high | both | ☑ |
 | F-09 | Frontend fetch race: poll + filter change + refresh, last-response-wins | ux, data-integrity | high | both | ☑ |
 | F-10 | Overlap check broken for bookings that cross midnight | data-integrity | high | both | ☐ |
 | F-11 | Date filter uses `startsWith` on ISO string — wrong across timezones | data-integrity, ux | high | both | ☐ |
@@ -92,7 +92,7 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 | F-20 | No rate limiting / no explicit body-size limits | security | low | static | ☐ |
 | F-21 | No request logging enrichment with tenant/user/correlation id | observability | low | static | ☐ |
 | F-22 | Three known CVEs in pinned deps (fastify, fast-uri, uuid); `npm audit` reports fixes available | security | medium | static | ☑ |
-| F-23 | Bad input (F-08) crashes list endpoint with HTTP 500 when `date` filter applied | data-integrity, availability | high | runtime | ☐ |
+| F-23 | Bad input (F-08) crashes list endpoint with HTTP 500 when `date` filter applied | data-integrity, availability | high | runtime | ☑ |
 | F-24 | No idempotency on `POST /api/bookings` — client retry / double-click creates duplicate bookings | data-integrity, api-design | medium | static | deferred (Phase 3 proposal) |
 
 <!-- Per-finding blocks below this line -->
@@ -223,10 +223,31 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 - **File(s):** `server/src/routes/bookings.ts:56-97`
 - **Classification:** data-integrity, api-design
 - **Severity:** high
-- **Verified:** static
+- **Verified:** both
 - **What:** Bodies are cast to `as { petId; sitterId; … }` with no schema validation. Missing fields produce `undefined` IDs that still flow through `createBooking`. `PATCH …/status` accepts any string for `status`.
 - **Why it matters:** Garbage records get persisted (rows with `petId: undefined`), and downstream filters silently exclude them. With Fastify schemas readily available, this is low-effort high-value.
-- **Fix (Phase 2):** _pending_
+- **Fix (Phase 2):** Added Fastify JSON schemas on all three booking endpoints:
+  - `POST /api/bookings` body: requires `petId`, `sitterId`, `scheduledDate` (format `date-time`), `startTime` and `endTime` (regex `^([01]\d|2[0-3]):[0-5]\d$`), and bounds `notes` to ≤2000 chars.
+  - `PATCH /api/bookings/:id/status` body: requires `status` from the enum `requested|confirmed|in_progress|completed|cancelled`.
+  - `GET /api/bookings` querystring: `page ≥ 1`, `1 ≤ limit ≤ 100`, optional `date` (format `date`), optional `status` (same enum). Defaults of `page=1, limit=10` declared in the schema and applied by AJV's `useDefaults`.
+
+  **Rides on F-22's upgrade:** the fastify body-schema validation bypass (GHSA-247c-9743-5963) is what made F-22 a precondition for this fix. With fastify pinned to 5.8.5, the schemas above are not bypassable via a `Content-Type: application/json` whitespace trick.
+
+  **Fastify default `additionalProperties` behavior:** Fastify's default AJV config sets `removeAdditional: 'all'`, so unknown properties are *stripped* silently rather than rejected with 400 — even when the schema declares `additionalProperties: false`. Probe #4 (sending `{"sneaky":"x", …}`) confirmed: request succeeded but the unknown field is dropped before reaching the handler. Data-integrity guarantee holds (unknown fields can't poison the store), strictness does not. For an admin API where the schema and client are owned by the same team, the default behavior is acceptable; if we wanted strict rejection we'd override the Fastify AJV factory to set `removeAdditional: false`. Documented here rather than fixed; flagging as a candidate hardening if security-strict is ever a requirement.
+
+  **F-07 clamp removed:** the defensive `Math.max(1, page)` in `listBookings` is gone — the querystring schema rejects `page < 1` at the boundary, so the clamp is dead code and was masking the underlying contract. The service comment now points at F-08 as the source of truth.
+
+  **Verified (full probe matrix):**
+  - POST `{}` → **400** `body must have required property 'petId'`
+  - POST with `startTime: "25:99"` → **400** pattern violation
+  - POST with `scheduledDate: "not-a-date"` → **400** format violation
+  - PATCH with `status: "gibberish"` → **400** enum violation
+  - GET with `page=0` → **400** `must be >= 1`
+  - GET with `limit=999` → **400** `must be <= 100`
+  - Valid POST still succeeds (sanity)
+  - Valid GET with `date=2026-04-08` returns 200 (used to 500 — see F-23) ✅
+
+  **Suggested regression test (Phase 3 suite):** for each endpoint, send one example invalid body per validation rule and assert HTTP 400 with a meaningful message string. Useful contract documentation as a side effect.
 
 ### F-09 — Frontend fetch race: poll + filter change + refresh, last-response-wins
 
@@ -374,7 +395,11 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 - **Verified:** runtime — `POST /api/bookings` with `{}` body succeeded; subsequent `GET /api/bookings?date=2026-04-08` returned `500 "Cannot read properties of undefined (reading 'startsWith')"`.
 - **What:** Because there is no schema (F-08), a single bad POST persists a booking with `scheduledDate: undefined`. The list endpoint's `startsWith` then throws, taking the date-filter feature down for every user of that tenant — including users who never made a bad request.
 - **Why it matters:** Escalates F-08 from "garbage data" to "API outage." A misbehaving client (or an attacker) can DoS the day-view for everyone. This is the kind of cross-customer blast radius the audit was set up to surface.
-- **Fix (Phase 2):** _pending_ — handled by F-08's schema fix at the boundary; defensive guard in the service is also worth adding.
+- **Fix (Phase 2):** Primary fix is upstream — F-08's POST schema now rejects rows without a well-formed `scheduledDate` at the boundary, so the garbage state that caused the 500 can no longer enter the store via the documented API path.
+
+  **Belt-and-braces defensive guard added at the service layer:** `listBookings` now filters with `typeof b.scheduledDate === 'string' && b.scheduledDate.startsWith(date)`. If a malformed row ever sneaks in via a future ingestion path (CSV import, migration, etc.), the filter returns an empty match instead of crashing. The `typeof` check is the minimum surface — F-11 (timezone filter) will rewrite this line entirely, at which point the check can move with it.
+
+  **Verified:** the exact Phase 1b probe (empty `POST` followed by `GET ?date=2026-04-08`) now produces 400 + 200 instead of 200 + 500. ✅
 
 ### F-22 — Three known CVEs in pinned dependencies
 
