@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import type { AuthContext, BookingStatus } from '../types/index.js';
 import { bookingService } from '../services/booking-service.js';
+import { store } from '../store/memory-store.js';
 
 export function bookingRoutes(app: FastifyInstance): void {
   /**
@@ -61,6 +62,18 @@ export function bookingRoutes(app: FastifyInstance): void {
       endTime: string;
       notes?: string;
     };
+
+    // Tenancy boundary: pet and sitter must belong to caller's tenant.
+    // 404 (not 403) for both missing and foreign so existence can't be probed.
+    const pet = store.getPet(body.petId);
+    if (!pet || pet.tenantId !== auth.tenantId) {
+      return reply.code(404).send({ error: 'Pet not found' });
+    }
+
+    const sitter = store.getSitter(body.sitterId);
+    if (!sitter || sitter.tenantId !== auth.tenantId) {
+      return reply.code(404).send({ error: 'Sitter not found' });
+    }
 
     try {
       const booking = await bookingService.createBooking({

@@ -73,7 +73,7 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 | F-01 | Tenant override via `?tenantId=` query param | tenancy, security | critical | both | ☑ |
 | F-02 | `GET /api/bookings/:id` performs no tenant check | tenancy | critical | both | ☑ |
 | F-03 | `PATCH /api/bookings/:id/status` performs no tenant check | tenancy, data-integrity | critical | both | ☑ |
-| F-04 | `POST /api/bookings` does not verify pet/sitter belong to caller's tenant | tenancy, data-integrity | critical | both | ☐ |
+| F-04 | `POST /api/bookings` does not verify pet/sitter belong to caller's tenant | tenancy, data-integrity | critical | both | ☑ |
 | F-05 | XSS via `innerHTML` interpolation of booking & pet fields | security | critical | both | ☐ |
 | F-06 | Double-booking race — overlap check has TOCTOU window | data-integrity | critical | both | ☑ |
 | F-07 | Pagination off-by-one (`offset = page * limit`) drops first page | data-integrity, ux | high | both | ☐ |
@@ -132,10 +132,20 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 - **File(s):** `server/src/routes/bookings.ts:56-83`, `server/src/services/booking-service.ts:69-120`
 - **Classification:** tenancy, data-integrity
 - **Severity:** critical
-- **Verified:** static
+- **Verified:** both
 - **What:** The created booking gets `tenantId: auth.tenantId`, but the supplied `petId` and `sitterId` are never checked against that tenant. A Portland staff user can create a booking under Portland that references a Seattle sitter or pet.
 - **Why it matters:** Mixed-tenant booking records corrupt every downstream filter, list, and report. It also opens a path to scheduling a foreign tenant's sitter (denial-of-service on their availability).
-- **Fix (Phase 2):** _pending_
+- **Fix (Phase 2):** Route handler now resolves `petId` and `sitterId` against the store and returns **404 (not 403)** if either is missing OR belongs to another tenant. Same status-code reasoning as F-02/F-03: unknown and foreign return the same code so cross-tenant IDs can't be enumerated via probe responses.
+
+  **Where the check lives:** in the route handler, consistent with the boundary pattern established in F-01/F-02/F-03. The service stays trust-only for the tenancy contract — every entry point that calls `bookingService.createBooking` is responsible for upstream validation. Today there's only one entry point, so this is sufficient. If we add a CLI / batch import / admin path later, each would need the same check (or we move it into the service — a small refactor).
+
+  **Why both the pet and the sitter (not just the sitter):** the overlap check in F-06 is keyed on `sitterId`, so a foreign sitter could trivially be used to *block* a competitor's calendar (DoS via reserved time slots). The pet check is for record-integrity — a booking that mixes tenants in its references quietly corrupts every downstream filter.
+
+  **Verified:**
+  - Portland → Seattle `sitter_003`: HTTP 404 `{"error":"Sitter not found"}`
+  - Portland → Seattle `pet_006`: HTTP 404 `{"error":"Pet not found"}`
+  - Portland → Portland refs: HTTP 200 `{"success":true,...}` (sanity)
+  - Portland → unknown `pet_nonexistent`: HTTP 404 `{"error":"Pet not found"}` (same response as foreign — existence not leaked) ✅
 
 ### F-05 — XSS via `innerHTML` interpolation of booking & pet fields
 
