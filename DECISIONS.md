@@ -79,7 +79,7 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 | F-07 | Pagination off-by-one (`offset = page * limit`) drops first page | data-integrity, ux | high | both | ☑ |
 | F-08 | No request body validation on `POST /api/bookings` or `PATCH …/status` | data-integrity, api-design | high | both | ☑ |
 | F-09 | Frontend fetch race: poll + filter change + refresh, last-response-wins | ux, data-integrity | high | both | ☑ |
-| F-10 | Overlap check broken for bookings that cross midnight | data-integrity | high | both | ☐ |
+| F-10 | Overlap check broken for bookings that cross midnight | data-integrity | high | both | ☑ |
 | F-11 | Date filter uses `startsWith` on ISO string — wrong across timezones | data-integrity, ux | high | both | ☐ |
 | F-12 | Wrong status codes — 404 returns 200, errors return 200 | api-design | medium | both | ☐ |
 | F-13 | Frontend branches on `result.error`, ignores HTTP status entirely | api-design, ux | medium | static | ☐ |
@@ -269,13 +269,25 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 
 ### F-10 — Overlap check broken for bookings that cross midnight
 
-- **File(s):** `server/src/services/booking-service.ts:78-84`
+- **File(s):** `server/src/store/memory-store.ts` (the fix landed here, where the overlap check now lives after F-06 moved it)
 - **Classification:** data-integrity
 - **Severity:** high
-- **Verified:** static (seed `booking_006` and `booking_011` have `startTime: '23:30'`, `endTime: '00:30'`)
+- **Verified:** both
 - **What:** Overlap computes `new Date(\`${date}T${endTime}\`)` for an end time that is on the next day, producing `existingEnd < existingStart`. The `newStart < existingEnd && newEnd > existingStart` predicate then misbehaves.
-- **Why it matters:** Overnight care is a real use case (already in the seed) and overlap checking silently fails for it.
-- **Fix (Phase 2):** _pending_
+- **Why it matters:** Overnight care is a real use case (already in the seed — `booking_006` and `booking_011`) and overlap checking silently fails for it.
+- **Fix (Phase 2):** Extracted a `bookingInterval(b)` helper inside the store module that builds `{ start, end }` from `scheduledDate + startTime + endTime`. When `endTime < startTime` (lex comparison — safe because both fields are validated to strict `HH:MM` format by the F-08 schema), the end Date is rolled into the next day with `+ ONE_DAY_MS`. The atomic create method (`tryCreateBookingForSitter`) now uses this helper for *both* the candidate and each existing booking. Same-day bookings produce the same intervals as before (`endTime ≥ startTime` skips the +24h branch), so this is purely additive.
+
+  **Why a helper at the store level and not in the service:** the helper expresses the booking-interval-as-instants invariant where the overlap check lives. F-06 already pushed atomicity into the store; F-10 extends that by making the time-interval computation a shared, named function instead of a copy-pasted snippet. Future tests can import and assert against `bookingInterval` directly.
+
+  **Out of scope here (covered by F-11/F-16):** the helper uses `new Date('YYYY-MM-DDTHH:MM')` which interprets the time in the *Node process's local* timezone — not the *tenant's* timezone. So a booking that "feels like" 23:30 Pacific stored with a UTC scheduledDate will produce intervals in the process timezone, not the tenant's. The F-10 fix is correct *relative to itself* (two bookings with the same convention overlap consistently), but the absolute wall-clock placement is the F-11/F-16 problem. Noting here so it doesn't read as a regression.
+
+  **Verified:**
+  - Phase 1b probe (identical overnight slot, same sitter) → now rejected with "Sitter has an overlapping booking for this time slot" ✓ (used to silently succeed)
+  - Adjacent overnight slot (next-day 00:00–01:30 against an existing 23:30→00:30) → also rejected, confirming the rolled-over end correctly extends into the next day ✓
+  - Different sitter, same overnight slot → still accepted ✓
+  - Same sitter, unrelated daytime slot → still accepted (sanity) ✓
+
+  **Suggested regression test (Phase 3 suite):** a focused test of `bookingInterval` for three cases (same-day, midnight-boundary, overnight roll-over), plus an integration test asserting that two identical overnight POSTs to the same sitter produce 1 success + 1 conflict (mirrors F-06's regression test).
 
 ### F-11 — Date filter uses `startsWith` on ISO string — wrong across timezones
 

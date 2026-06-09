@@ -1,6 +1,24 @@
 import type { Booking, Pet, Sitter, Tenant } from '../types/index.js';
 import { tenants as seedTenants, pets as seedPets, bookings as seedBookings, sitters as seedSitters } from './seed.js';
 
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Build the concrete [start, end) instant interval for a booking. Overnight
+ * bookings — where endTime is lex-less than startTime (e.g. 23:30 → 00:30) —
+ * roll the end into the next day. Lex comparison is safe because both fields
+ * are validated to the strict `HH:MM` format in the route's body schema (F-08).
+ */
+function bookingInterval(b: Booking): { start: Date; end: Date } {
+  const [date] = b.scheduledDate.split('T');
+  const start = new Date(`${date}T${b.startTime}`);
+  let end = new Date(`${date}T${b.endTime}`);
+  if (b.endTime < b.startTime) {
+    end = new Date(end.getTime() + ONE_DAY_MS);
+  }
+  return { start, end };
+}
+
 class MemoryStore {
   private tenants: Map<string, Tenant> = new Map();
   private pets: Map<string, Pet> = new Map();
@@ -74,17 +92,13 @@ class MemoryStore {
   public tryCreateBookingForSitter(
     booking: Booking,
   ): { created: Booking } | { conflict: { existingBookingId: string } } {
-    const [candidateDate] = booking.scheduledDate.split('T');
-    const candidateStart = new Date(`${candidateDate}T${booking.startTime}`);
-    const candidateEnd = new Date(`${candidateDate}T${booking.endTime}`);
+    const candidate = bookingInterval(booking);
 
     for (const existing of this.bookings.values()) {
       if (existing.sitterId !== booking.sitterId) continue;
       if (existing.status === 'cancelled') continue;
-      const [existingDate] = existing.scheduledDate.split('T');
-      const existingStart = new Date(`${existingDate}T${existing.startTime}`);
-      const existingEnd = new Date(`${existingDate}T${existing.endTime}`);
-      if (candidateStart < existingEnd && candidateEnd > existingStart) {
+      const exInterval = bookingInterval(existing);
+      if (candidate.start < exInterval.end && candidate.end > exInterval.start) {
         return { conflict: { existingBookingId: existing.id } };
       }
     }
