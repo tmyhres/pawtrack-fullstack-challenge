@@ -50,13 +50,16 @@ export class BookingService {
     const total = bookings.length;
     const totalPages = Math.ceil(total / limit);
 
-    const offset = page * limit;
+    // Pagination is 1-indexed in the API contract (client defaults to page=1).
+    // Defensive clamp against page < 1; full input validation lands with F-08.
+    const safePage = Math.max(1, page);
+    const offset = (safePage - 1) * limit;
     const paginatedBookings = bookings.slice(offset, offset + limit);
 
     return {
       data: paginatedBookings,
       total,
-      page,
+      page: safePage,
       limit,
       totalPages,
     };

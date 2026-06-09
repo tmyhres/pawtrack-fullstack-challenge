@@ -76,7 +76,7 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 | F-04 | `POST /api/bookings` does not verify pet/sitter belong to caller's tenant | tenancy, data-integrity | critical | both | ☑ |
 | F-05 | XSS via `innerHTML` interpolation of booking & pet fields | security | critical | both | ☑ |
 | F-06 | Double-booking race — overlap check has TOCTOU window | data-integrity | critical | both | ☑ |
-| F-07 | Pagination off-by-one (`offset = page * limit`) drops first page | data-integrity, ux | high | both | ☐ |
+| F-07 | Pagination off-by-one (`offset = page * limit`) drops first page | data-integrity, ux | high | both | ☑ |
 | F-08 | No request body validation on `POST /api/bookings` or `PATCH …/status` | data-integrity, api-design | high | both | ☐ |
 | F-09 | Frontend fetch race: poll + filter change + refresh, last-response-wins | ux, data-integrity | high | static | ☐ |
 | F-10 | Overlap check broken for bookings that cross midnight | data-integrity | high | both | ☐ |
@@ -202,10 +202,21 @@ The default rule for Phase 2 is **fix by severity**: critical → high → mediu
 - **File(s):** `server/src/services/booking-service.ts:53`
 - **Classification:** data-integrity, ux
 - **Severity:** high
-- **Verified:** static
+- **Verified:** both
 - **What:** `const offset = page * limit;` combined with the client defaulting to `page: 1` (`client/app.js:18`) means page 1 silently returns items 5–9, skipping the first 5 records. The pagination UI's "page 1" is actually page 2 of the underlying data.
 - **Why it matters:** Records appear and disappear from the dashboard depending on the page math, and the first booking in any sorted list is unreachable.
-- **Fix (Phase 2):** _pending_
+- **Fix (Phase 2):** Changed `offset = page * limit` to `offset = (safePage - 1) * limit` where `safePage = Math.max(1, page)`. The API contract is now explicitly 1-indexed, matching the client default and matching the pagination UI labels. Also echo back the *clamped* page in the response (so a caller passing `page=0` sees `page: 1` in the response, not a misleading `page: 0`).
+
+  **Why a clamp rather than a 400:** F-08 will add proper schema validation that rejects `page < 1` at the boundary. Until then, the clamp prevents `slice(-N, …)` from quietly returning the wrong window when a buggy caller sends `page=0`. Mentioning here so the clamp can be removed when F-08 lands — the schema becomes the single source of truth.
+
+  **Verified:**
+  - `page=1 limit=5` → items 0-4, page 1 of 2, ids start with `booking_005` (newest in seed)
+  - `page=2 limit=5` → items 5-9, no overlap with page 1
+  - `page=3 limit=5` → empty (past last page, correct)
+  - `page=0 limit=5` → server returns `page: 1` (clamped) and the newest 5 records
+  - No booking id appears on both `page=1` and `page=2` (confirms fenceposts) ✅
+
+  **Suggested regression test (Phase 3 suite):** for a seeded tenant with N > limit bookings, assert `page=1` includes the chronologically newest record, `page=2` excludes it, and no record overlaps between adjacent pages.
 
 ### F-08 — No request body validation on `POST /api/bookings` or `PATCH …/status`
 
