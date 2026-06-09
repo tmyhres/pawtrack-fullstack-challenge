@@ -3,37 +3,7 @@ import type { Booking, BookingStatus, PaginatedResult, AuthContext } from '../ty
 import { VALID_TRANSITIONS } from '../types/index.js';
 import { store } from '../store/memory-store.js';
 import { eventBus } from './event-emitter.js';
-
-// Build a YYYY-MM-DD formatter for an IANA timezone. `Intl.DateTimeFormat`
-// throws a RangeError on an invalid zone string, so we fall back to UTC rather
-// than letting a corrupted tenant timezone 500 the list endpoint. Formatters
-// are cached so the date filter doesn't reconstruct one per booking row.
-const dateFormatterCache = new Map<string, Intl.DateTimeFormat>();
-
-function dateFormatterFor(tz: string): Intl.DateTimeFormat {
-  const cached = dateFormatterCache.get(tz);
-  if (cached) return cached;
-
-  const opts: Intl.DateTimeFormatOptions = { year: 'numeric', month: '2-digit', day: '2-digit' };
-  let fmt: Intl.DateTimeFormat;
-  try {
-    fmt = new Intl.DateTimeFormat('en-US', { ...opts, timeZone: tz });
-  } catch {
-    fmt = new Intl.DateTimeFormat('en-US', { ...opts, timeZone: 'UTC' });
-  }
-  dateFormatterCache.set(tz, fmt);
-  return fmt;
-}
-
-// Return YYYY-MM-DD for `instant` as observed in `formatter`'s timezone.
-// Uses formatToParts rather than .format() so we don't depend on a locale's
-// default date layout — explicit assembly is robust across ICU versions.
-function formatLocalDate(instant: Date, formatter: Intl.DateTimeFormat): string {
-  const parts = formatter.formatToParts(instant);
-  const get = (type: 'year' | 'month' | 'day') =>
-    parts.find(p => p.type === type)?.value ?? '';
-  return `${get('year')}-${get('month')}-${get('day')}`;
-}
+import { tenantLocalDate } from '../util/dates.js';
 
 interface ListBookingsParams {
   tenantId: string;
@@ -64,21 +34,18 @@ export class BookingService {
 
     let bookings = store.getBookingsByTenant(tenantId);
 
-    // Filter by date in the *tenant's* timezone, not by UTC string prefix.
-    // The schema (F-08) validates `date` as YYYY-MM-DD. We project each
-    // booking's instant into the tenant's IANA timezone and compare the
-    // resulting local YYYY-MM-DD. Fallback to UTC if a tenant is missing a
-    // timezone — better to bucket by UTC than 500 on the request.
-    // The `typeof` guard is belt-and-braces against malformed scheduledDate
-    // rows arriving via a future ingestion path (F-23).
+    // Filter by the tenant-local service date (see util/dates.ts), the same
+    // notion the sitter overlap check uses — never the raw UTC string prefix.
+    // The schema (F-08) validates `date` as YYYY-MM-DD. `tenantLocalDate`
+    // returns null on a malformed scheduledDate, which then fails the equality
+    // and excludes the row (belt-and-braces against bad ingestion, F-23). The
+    // `typeof` guard keeps that path purely string-typed.
     if (date) {
       const tenant = store.getTenant(tenantId);
-      const formatter = dateFormatterFor(tenant?.timezone ?? 'UTC');
+      const tz = tenant?.timezone ?? 'UTC';
       bookings = bookings.filter(b => {
         if (typeof b.scheduledDate !== 'string') return false;
-        const instant = new Date(b.scheduledDate);
-        if (Number.isNaN(instant.getTime())) return false;
-        return formatLocalDate(instant, formatter) === date;
+        return tenantLocalDate(b.scheduledDate, tz) === date;
       });
     }
 

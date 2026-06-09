@@ -33,6 +33,17 @@ function errorText(result, response, fallback) {
   return (result && (result.message || result.error)) || `${fallback} (${response.status})`;
 }
 
+// A <input type="date"> yields a bare "YYYY-MM-DD". `new Date(value)` parses
+// that as UTC midnight, which lands on the *previous* calendar day once the
+// server projects it into a behind-UTC tenant timezone (e.g. Portland) — the
+// booking would then file under the wrong day and dodge overlap checks.
+// Anchoring at noon UTC keeps the selected calendar date intact for every
+// real tenant timezone (UTC-12 .. UTC+11). The actual time-of-day is carried
+// separately by startTime/endTime.
+function scheduledDateFromInput(value) {
+  return new Date(`${value}T12:00:00.000Z`).toISOString();
+}
+
 // ============================================
 // Initialization
 // ============================================
@@ -331,7 +342,7 @@ async function createBooking() {
   const body = {
     petId: document.getElementById('pet-select').value,
     sitterId: document.getElementById('sitter-select').value,
-    scheduledDate: new Date(document.getElementById('booking-date').value).toISOString(),
+    scheduledDate: scheduledDateFromInput(document.getElementById('booking-date').value),
     startTime: document.getElementById('start-time').value,
     endTime: document.getElementById('end-time').value,
     notes: document.getElementById('booking-notes').value,

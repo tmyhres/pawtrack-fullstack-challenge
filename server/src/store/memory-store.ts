@@ -1,19 +1,25 @@
 import type { Booking, Pet, Sitter, Tenant } from '../types/index.js';
 import { tenants as seedTenants, pets as seedPets, bookings as seedBookings, sitters as seedSitters } from './seed.js';
+import { tenantLocalDate } from '../util/dates.js';
 
 /**
- * Build the concrete [start, end) instant interval for a booking. Overnight
- * bookings — where endTime is lex-less than startTime (e.g. 23:30 → 00:30) —
- * roll the end into the next day. Lex comparison is safe because both fields
- * are validated to the strict `HH:MM` format in the route's body schema (F-08).
+ * Build the concrete [start, end) interval for a booking, on its tenant-LOCAL
+ * service date. Deriving the day from `tenantLocalDate(...)` rather than
+ * `scheduledDate.split('T')[0]` is what makes overlap agree with the list
+ * filter: two bookings on the same local night now share a base date even when
+ * their `scheduledDate` instants are shaped differently (seed stores the true
+ * instant; the client submits a midday anchor). The raw-UTC date-part let a
+ * client-shaped overnight slot slip past the conflict check.
  *
- * The rollover advances the calendar date (setDate) rather than adding a fixed
- * 24h in milliseconds: across a DST transition a local day is 23 or 25 hours,
- * so `+86_400_000ms` would shift the end's wall-clock time by an hour and
- * skew overlap detection on those nights.
+ * Overnight bookings — endTime lex-less than startTime (e.g. 23:30 → 00:30) —
+ * roll the end into the next day. Lex compare is safe because both fields are
+ * validated to strict `HH:MM` in the route schema (F-08). The rollover
+ * advances the calendar date (setDate) rather than adding 86_400_000ms, since
+ * a DST-transition local day is 23 or 25 hours and a fixed +24h would shift
+ * the end's wall-clock by an hour.
  */
-function bookingInterval(b: Booking): { start: Date; end: Date } {
-  const [date] = b.scheduledDate.split('T');
+function bookingInterval(b: Booking, tz: string): { start: Date; end: Date } {
+  const date = tenantLocalDate(b.scheduledDate, tz) ?? b.scheduledDate.split('T')[0];
   const start = new Date(`${date}T${b.startTime}`);
   const end = new Date(`${date}T${b.endTime}`);
   if (b.endTime < b.startTime) {
@@ -95,12 +101,15 @@ class MemoryStore {
   public tryCreateBookingForSitter(
     booking: Booking,
   ): { created: Booking } | { conflict: { existingBookingId: string } } {
-    const candidate = bookingInterval(booking);
+    // A sitter belongs to exactly one tenant (enforced at create, F-04), so
+    // every booking scanned here shares the candidate's tenant/timezone.
+    const tz = this.tenants.get(booking.tenantId)?.timezone ?? 'UTC';
+    const candidate = bookingInterval(booking, tz);
 
     for (const existing of this.bookings.values()) {
       if (existing.sitterId !== booking.sitterId) continue;
       if (existing.status === 'cancelled') continue;
-      const exInterval = bookingInterval(existing);
+      const exInterval = bookingInterval(existing, tz);
       if (candidate.start < exInterval.end && candidate.end > exInterval.start) {
         return { conflict: { existingBookingId: existing.id } };
       }

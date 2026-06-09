@@ -220,6 +220,49 @@ describe('F-11 — date filter respects the tenant timezone, not UTC prefix', ()
   });
 });
 
+describe('client-shaped dates: service date is consistent across submit/filter/overlap', () => {
+  // Replicates exactly what client/app.js submits for an <input type="date">:
+  // the picked day anchored at noon UTC. A regression here (e.g. reverting to
+  // UTC-midnight) would refile the booking under the previous local day and
+  // re-open the overlap gap.
+  const clientScheduledDate = (pickedDate: string) => `${pickedDate}T12:00:00.000Z`;
+
+  it('POST a picked date, then GET ?date=<picked> includes it (Portland)', async () => {
+    const picked = '2027-04-08';
+    const post = await app.inject({
+      method: 'POST', url: '/api/bookings',
+      headers: { ...PORTLAND, 'Content-Type': 'application/json' },
+      payload: {
+        petId: 'pet_001', sitterId: 'sitter_001',
+        scheduledDate: clientScheduledDate(picked),
+        startTime: '10:00', endTime: '11:00',
+      },
+    });
+    expect(post.statusCode).toBe(201);
+    const id = post.json().data.id;
+
+    const sameDay = await app.inject({ method: 'GET', url: `/api/bookings?date=${picked}&limit=50`, headers: PORTLAND });
+    const prevDay = await app.inject({ method: 'GET', url: '/api/bookings?date=2027-04-07&limit=50', headers: PORTLAND });
+    expect(sameDay.json().data.map((b: any) => b.id)).toContain(id);
+    expect(prevDay.json().data.map((b: any) => b.id)).not.toContain(id);
+  });
+
+  it('client-shaped overnight collides with a same-local-night booking -> 409', async () => {
+    // booking_006 (seed): 2026-04-09T06:30:00Z = 2026-04-08 23:30 PT, sitter_002.
+    // The client picks 2026-04-08 for the same 23:30->00:30 overnight slot.
+    const res = await app.inject({
+      method: 'POST', url: '/api/bookings',
+      headers: { ...PORTLAND, 'Content-Type': 'application/json' },
+      payload: {
+        petId: 'pet_001', sitterId: 'sitter_002',
+        scheduledDate: clientScheduledDate('2026-04-08'),
+        startTime: '23:30', endTime: '00:30',
+      },
+    });
+    expect(res.statusCode).toBe(409);
+  });
+});
+
 describe('F-12 — HTTP status codes express outcome', () => {
   it('successful POST -> 201 with {data}', async () => {
     const res = await app.inject({
